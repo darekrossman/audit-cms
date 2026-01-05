@@ -37,7 +37,11 @@ export function serializeDocument(
   metadata: DocumentMetadata,
   content: string,
 ): string {
-  const frontmatter = matter.stringify(content, metadata)
+  // Filter out undefined values to prevent YAML serialization errors
+  const cleanMetadata = Object.fromEntries(
+    Object.entries(metadata).filter(([_, v]) => v !== undefined),
+  )
+  const frontmatter = matter.stringify(content, cleanMetadata)
   return frontmatter
 }
 
