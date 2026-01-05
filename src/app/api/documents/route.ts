@@ -7,7 +7,7 @@ import { syncDocumentToGitHub } from '@/lib/github/sync'
 // Cached helper for listing documents
 async function getDocumentsList(parent?: string) {
   'use cache'
-  cacheLife('frequent')
+  cacheLife('days')
   cacheTag('documents-list')
 
   return await listDocuments(parent)

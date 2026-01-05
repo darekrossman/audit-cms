@@ -14,7 +14,7 @@ import {
 // Cached helper for getting a document
 async function getDocumentCached(slug: string) {
   'use cache'
-  cacheLife('documents')
+  cacheLife('days')
   cacheTag(`doc-${slug}`)
 
   return await getDocument(slug)

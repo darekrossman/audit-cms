@@ -2,7 +2,7 @@ import Link from 'next/link'
 import { ModeToggle } from '@/components/mode-toggle'
 import { Button } from '@/components/ui/button'
 
-export default function EditorLayout({
+export default function DocsLayout({
   children,
 }: {
   children: React.ReactNode
@@ -13,27 +13,19 @@ export default function EditorLayout({
       <header className="border-b bg-background sticky top-0 z-50">
         <div className="container mx-auto px-4 h-14 flex items-center justify-between">
           <div className="flex items-center gap-4">
-            <Link href="/editor" className="font-semibold">
+            <Link href="/docs" className="font-semibold">
               Audit CMS
             </Link>
             <nav className="flex items-center gap-2">
-              <Link href="/docs">
+              <Link href="/editor">
                 <Button variant="ghost" size="sm">
-                  View Docs
+                  Editor
                 </Button>
               </Link>
             </nav>
           </div>
           <div className="flex items-center gap-2">
-            <Link href="/editor/new">
-              <Button size="sm">New Document</Button>
-            </Link>
             <ModeToggle />
-            <form action="/api/auth" method="DELETE">
-              <Button type="submit" variant="ghost" size="sm">
-                Logout
-              </Button>
-            </form>
           </div>
         </div>
       </header>

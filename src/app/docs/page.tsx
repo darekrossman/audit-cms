@@ -11,7 +11,7 @@ import { listDocuments } from '@/lib/content/storage'
 
 async function getDocuments() {
   'use cache'
-  cacheLife('frequent')
+  cacheLife('days')
   cacheTag('documents-list')
 
   const docs = await listDocuments()

@@ -4,7 +4,7 @@ import { getDocumentTree } from '@/lib/content/storage'
 
 async function getDocumentTreeCached() {
   'use cache'
-  cacheLife('frequent')
+  cacheLife('days')
   cacheTag('documents-list')
 
   return await getDocumentTree()

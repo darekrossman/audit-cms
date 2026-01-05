@@ -14,7 +14,7 @@ export async function renderDocument(
   slug: string,
 ): Promise<RenderResult | null> {
   'use cache'
-  cacheLife('documents')
+  cacheLife('days')
   cacheTag(`doc-${slug}`)
 
   const doc = await getDocument(slug)
