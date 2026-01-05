@@ -1,0 +1,38 @@
+---
+id: da216491-6561-4724-9f6b-e0cc39390947
+title: Security Audit Report
+slug: security-audit-report
+description: Example security audit findings and recommendations for code review
+createdAt: '2026-01-05T23:25:57.154Z'
+updatedAt: '2026-01-05T23:25:57.154Z'
+status: draft
+tags: []
+order: 0
+---
+# Security Audit Report
+
+## Executive Summary
+
+This document outlines the findings from our security audit.
+
+## Critical Findings
+
+### 1. SQL Injection Vulnerability
+
+```typescript
+// Bad: Direct string concatenation
+const query = `SELECT * FROM users WHERE id = ${userId}`
+
+// Good: Parameterized query
+const query = 'SELECT * FROM users WHERE id = $1'
+```
+
+### 2. Missing Input Validation
+
+All user inputs should be validated before processing.
+
+## Recommendations
+
+- Implement parameterized queries
+- Add input validation middleware
+- Enable HTTPS everywhere
