@@ -1,0 +1,330 @@
+---
+id: "afba031a-c296-4400-bd3c-a05c0753a72c"
+title: "Image Optimization Analysis"
+slug: "image-optimization-analysis"
+description: "Performance audit and migration plan for using Next.js Image Optimization"
+createdAt: "2025-01-05T00:00:00.000Z"
+updatedAt: "2025-01-05T00:00:00.000Z"
+status: "published"
+tags: ["images", "optimization", "performance"]
+order: 5
+---
+# Image Optimization Analysis: DoorDash Web Marketing Apps
+
+## Executive Summary
+
+The six web-* marketing apps use a custom `ContentfulImage` component instead of Next.js's `next/image`. Since these apps are hosted on Vercel, this means Vercel Image Optimization is available but unused. Migrating to `next/image` would simplify the codebase while enabling automatic optimizations currently handled manually.
+
+### Performance Audit Summary
+
+| Site | LCP (ms) | Primary Issue | LCP Image Priority |
+|------|----------|---------------|-------------------|
+| about.doordash.com | 533 | Resource load delay (46%) | Low |
+| blog.doordash.com | 641 | Render delay (51%) | Medium |
+| business.doordash.com | 665 | Render delay (50%) | Medium |
+| dasher.doordash.com | 678 | Resource load delay (66%) | Low |
+| advertising.doordash.com | 1556 | Render delay (84%) | N/A (text LCP) |
+| merchants.doordash.com | 1674 | Render delay (77%) | Low |
+
+**Common finding:** All LCP images load with "Low" or "Medium" browser priority instead of "High".
+
+---
+
+## Current vs next/image Comparison
+
+### What's Being Handled Manually Today
+
+The current `ContentfulImage` component (`packages/helper-contentful/src/contentfulImage.tsx`) manually implements:
+
+| Feature | Current Implementation | With next/image |
+|---------|----------------------|-----------------|
+| **Responsive srcset** | Manual breakpoints: `[1600, 1366, 1024, 768, 640]` | Automatic via `sizes` prop |
+| **Format conversion** | Manual WebP via Contentful API (`fm=webp`) | Automatic AVIF/WebP negotiation |
+| **Lazy loading** | Manual `loading="lazy"` prop | Built-in with blur placeholder |
+| **Priority loading** | Not supported | `priority` prop for LCP images |
+| **Preload hints** | Not implemented | Automatic for priority images |
+| **Aspect ratio / CLS** | Manual width/height required | Automatic from import or `fill` |
+| **Quality optimization** | Fixed 60% | Adaptive, configurable per-image |
+
+### Code Complexity Comparison
+
+**Current approach** (simplified):
+```tsx
+// ContentfulImage - 312 lines of custom logic
+const ContentfulImage = (props) => {
+  // Manual srcset generation
+  const srcSetToUse = props.srcSetOverride || generatedSrcSet || defaultSrcSetSizes
+
+  // Manual format handling with picture element for PNG
+  if (isPng(props.image)) {
+    return (
+      <picture>
+        <source type='image/webp' srcSet={webpSet.join(', ')} />
+        <source type='image/png' srcSet={pngSet.join(', ')} />
+        <img ... />
+      </picture>
+    )
+  }
+
+  // Manual WebP srcset for other formats
+  return <img srcSet={jpegSrcSet.join(', ')} ... />
+}
+```
+
+**With next/image**:
+```tsx
+import Image from 'next/image'
+
+// Hero image with priority (LCP candidate)
+<Image
+  src={`https:${asset.fields.file.url}`}
+  alt={asset.fields.description}
+  fill
+  priority
+  sizes="(max-width: 768px) 100vw, 50vw"
+/>
+
+// Regular image with lazy loading (automatic)
+<Image
+  src={`https:${asset.fields.file.url}`}
+  alt={asset.fields.description}
+  width={800}
+  height={600}
+  sizes="(max-width: 768px) 100vw, 33vw"
+/>
+```
+
+---
+
+## Key LCP Issues to Address
+
+### 1. Missing `fetchpriority="high"` on Hero Images
+
+**Problem:** LCP images discovered late by the browser
+
+```json
+// From performance audits
+"lcpResource": {
+  "priority": "Low",
+  "recommendation": "Add fetchpriority='high' to LCP image"
+}
+```
+
+**Current component doesn't support priority:**
+```tsx
+// contentfulImage.tsx - no fetchpriority prop
+<img
+  loading={props.lazyLoad ? 'lazy' : 'eager'}
+  // fetchpriority not available
+/>
+```
+
+**next/image solution:**
+```tsx
+<Image priority />  // Adds fetchpriority="high" + preload hint automatically
+```
+
+### 2. No Automatic Preload for Hero Images
+
+**Problem:** Hero images aren't preloaded in `<head>`, adding 100-400ms to LCP
+
+**next/image solution:** When `priority` is set, Next.js automatically adds:
+```html
+<link rel="preload" as="image" href="/_next/image?url=..." imageSrcSet="..." />
+```
+
+### 3. Manual Format Negotiation
+
+**Problem:** Current implementation only serves WebP, missing AVIF (20-30% smaller)
+
+**next/image with Vercel:** Automatically serves AVIF when browser supports it via Accept header negotiation.
+
+---
+
+## How Vercel Image Optimization Works with next/image
+
+When using `next/image` on Vercel, images are automatically routed through `/_next/image`:
+
+```
+Request: /_next/image?url=/hero.jpg&w=1200&q=75
+         ↓
+Vercel Edge: Check cache (up to 31 days)
+         ↓
+Cache MISS: Transform image (resize, convert to AVIF/WebP)
+         ↓
+Response: Optimized image with proper Cache-Control headers
+```
+
+### Automatic Behaviors
+
+1. **Format selection**: AVIF if supported, WebP fallback, original as last resort
+2. **Responsive images**: Generates srcset based on `deviceSizes` and `imageSizes` config
+3. **Quality**: Default 75%, configurable per-image or globally
+4. **Caching**: Transformed images cached up to 31 days on Vercel's edge network
+5. **Priority handling**: `priority` prop adds `fetchpriority="high"` and preload link
+
+### Configuration Required
+
+```javascript
+// next.config.js
+const nextConfig = {
+  images: {
+    remotePatterns: [
+      {
+        protocol: 'https',
+        hostname: 'images.ctfassets.net',
+        pathname: '/trvmqu12jq2l/**', // DoorDash Contentful space
+      },
+      {
+        protocol: 'https',
+        hostname: 'cdn4dd.com',
+      },
+      {
+        protocol: 'https',
+        hostname: 'assets.doordash.team',
+      },
+    ],
+    formats: ['image/avif', 'image/webp'],
+  },
+}
+```
+
+---
+
+## Migration Approach
+
+### Phase 1: Quick Wins (No Migration Required)
+
+Add `fetchpriority` support to existing `ContentfulImage`:
+
+```tsx
+// contentfulImage.tsx
+export type ContentfulImageProps = {
+  // ... existing props
+  fetchPriority?: 'high' | 'low' | 'auto'
+}
+
+// In render:
+<img
+  fetchpriority={props.fetchPriority}
+  loading={props.lazyLoad ? 'lazy' : 'eager'}
+  ...
+/>
+```
+
+Update hero components:
+```tsx
+// mainHeroImageMedia.tsx
+<StyledImage
+  image={props.image}
+  fetchPriority="high"
+  lazyLoad={false}
+/>
+```
+
+### Phase 2: next/image Wrapper
+
+Create a Contentful-aware wrapper around next/image:
+
+```tsx
+// packages/helper-contentful/src/optimizedImage.tsx
+import Image, { ImageProps } from 'next/image'
+import { ContentfulAsset } from './interfaces'
+
+interface ContentfulImageProps extends Omit<ImageProps, 'src' | 'alt'> {
+  asset: ContentfulAsset
+  alt?: string
+}
+
+export function ContentfulOptimizedImage({
+  asset,
+  alt,
+  ...props
+}: ContentfulImageProps) {
+  const src = asset.fields.file?.url
+  if (!src) return null
+
+  return (
+    <Image
+      src={`https:${src}`}
+      alt={alt || asset.fields.description || asset.fields.title || ''}
+      {...props}
+    />
+  )
+}
+```
+
+### Phase 3: Component Migration
+
+Priority order for migration:
+
+1. **MainHeroImageMedia** - Homepage heroes, highest LCP impact
+2. **BlogPostHero** - Blog article heroes
+3. **TwoColumnImageMedia** - Feature sections
+4. **ContentCard** - Card images throughout site
+5. **ImageGallery** - Gallery grids
+6. **Rich text embedded images** - Via simpleContentfulRenderer
+
+Example migration:
+
+```tsx
+// Before: mainHeroImageMedia.tsx
+const MainHeroImageMedia = (props) => (
+  <StyledImage
+    image={props.image}
+    options={{ maxWidth: 600 }}
+  />
+)
+
+// After: mainHeroImageMedia.tsx
+import { ContentfulOptimizedImage } from '@doordash-marketing/helper-contentful'
+
+const MainHeroImageMedia = (props) => (
+  <ContentfulOptimizedImage
+    asset={props.image}
+    fill
+    priority
+    sizes="(max-width: 768px) 100vw, 50vw"
+    style={{ objectFit: 'cover', objectPosition: 'left center' }}
+  />
+)
+```
+
+---
+
+## Technical Details
+
+### Limits
+
+| Limit | Value |
+|-------|-------|
+| Max transformed image size | 10 MB |
+| Max source dimensions | 8192 × 8192 px |
+| Supported output formats | WebP, AVIF, JPEG, PNG |
+| Cache duration | Up to 31 days |
+
+### Compression Benchmarks
+
+| Format | vs JPEG | vs WebP |
+|--------|---------|---------|
+| WebP | 25-34% smaller | - |
+| AVIF | 50-65% smaller | 20-30% smaller |
+
+*Sources: [SpeedVitals](https://speedvitals.com/blog/webp-vs-avif/), [Smashing Magazine](https://www.smashingmagazine.com/2021/09/modern-image-formats-avif-webp/)*
+
+### Cost Optimization
+
+From [Vercel docs](https://vercel.com/docs/image-optimization/managing-image-optimization-costs):
+
+- Set 31-day cache headers for images that don't change frequently
+- Configure `imageSizes` and `deviceSizes` to match actual usage
+- Use `unoptimized` prop for images under 10KB, SVGs, and GIFs
+- Monitor usage via [Observability Dashboard](https://vercel.com/changelog/new-observability-dashboard-for-image-optimization)
+
+## References
+
+- [Vercel Image Optimization](https://vercel.com/docs/image-optimization)
+- [next/image API Reference](https://nextjs.org/docs/app/api-reference/components/image)
+- [Limits and Pricing](https://vercel.com/docs/image-optimization/limits-and-pricing)
+- [Managing Usage & Costs](https://vercel.com/docs/image-optimization/managing-image-optimization-costs)
+- [Optimize LCP - web.dev](https://web.dev/articles/optimize-lcp)

@@ -1,0 +1,952 @@
+---
+id: "48a25d57-1748-4d2f-b0c5-f7c670b9558c"
+title: "Next.js 16 App Router Migration Plan"
+slug: "next16-app-router-migration-plan"
+description: "Phased migration strategy for upgrading from Next.js 14 Pages Router to Next.js 16 App Router"
+createdAt: "2025-01-05T00:00:00.000Z"
+updatedAt: "2025-01-05T00:00:00.000Z"
+status: "published"
+tags: ["nextjs", "migration", "app-router"]
+order: 3
+---
+# Next.js 16 App Router Migration Plan
+
+## Executive Overview
+
+This document outlines a phased migration strategy for upgrading the DoorDash web properties from Next.js 14.1.0 (Pages Router) to Next.js 16 with the App Router. The migration prioritizes stability through incremental adoption, enabling the Pages and App routers to coexist during the transition.
+
+### Current State Summary
+
+| Application | Domain | Page Routes | API Routes | Locales |
+|-------------|--------|-------------|------------|---------|
+| web-ads | advertising.doordash.com | ~8 | 4 | 3 |
+| web-corp | about.doordash.com | ~12 | 6 | 3 |
+| web-cx-blog | blog.doordash.com | ~15 | 4 | 3 |
+| web-ddfw | business.doordash.com | ~10 | 4 | 3 |
+| web-dx | dasher.doordash.com | ~12 | 4 | 5 |
+| web-mx | merchants.doordash.com | ~18 | 7 | 5 |
+
+All applications share:
+- Next.js 14.1.0 with Pages Router
+- React 18.2.0
+- `getStaticProps` / `getStaticPaths` with ISR (revalidate: 60)
+- Catch-all routes: `[lang]/[[...slug]].tsx`
+- styled-components 5.3.11 with SSR
+- Custom locale middleware via `helper-routing`
+- Provider stack: WebsiteProvider, NinetailedProvider, AnalyticsProvider, etc.
+
+---
+
+## Why Migrate to App Router
+
+### The Server Components Mental Model
+
+The App Router introduces a fundamental shift in how React applications render. Instead of the traditional model where all components ship JavaScript to the client and hydrate on load, **Server Components** execute exclusively on the server and send only their rendered HTML output.
+
+This is not merely an optimization—it represents a new way of thinking about component architecture:
+
+**Pages Router (Current):** Every component is a potential client component. Even if rendered on the server via SSR/SSG, the JavaScript bundle includes all component code for hydration. Data fetching happens at the page level via `getStaticProps`/`getServerSideProps`, then props cascade down through the component tree.
+
+**App Router (Target):** Components are Server Components by default. They can directly `await` data, access databases, read files, and call APIs—all without shipping that logic to the client. Only components that need interactivity (`useState`, `useEffect`, event handlers) are marked with `'use client'` and hydrated.
+
+### Expected Improvements
+
+**Performance Gains:**
+- **Reduced JavaScript bundle size**: Server Components eliminate JS for non-interactive UI. For CMS-driven sites like these, the majority of content (headers, text blocks, images, CTAs) can remain server-only
+- **Faster Time to Interactive (TTI)**: Less JavaScript to parse and execute means faster interactivity
+- **Streaming and Suspense**: Layouts and pages stream progressively, showing content as it becomes ready rather than blocking on the slowest data source
+- **Partial Prerendering (PPR)**: With Cache Components enabled, routes generate a static HTML shell at build time while dynamic content streams at request time—combining static site speed with dynamic flexibility
+
+**Developer Experience:**
+- **Colocated data fetching**: Data fetching moves from page-level `getStaticProps` into components where data is consumed, improving locality and reducing prop drilling
+- **Layouts that persist**: Shared layouts don't re-render on navigation, preserving state and enabling instant route transitions
+- **Simplified mental model for caching**: The `use cache` directive provides fine-grained control over what gets cached and for how long, replacing the implicit behavior of `getStaticProps` with explicit declarations
+- **File-based conventions**: `loading.tsx`, `error.tsx`, `not-found.tsx` provide automatic loading and error states per route segment
+
+**Architecture Benefits:**
+- **React 19 features**: Access to Actions, `useFormStatus`, `useOptimistic`, and other primitives for form handling
+- **Future-proof foundation**: Cache Components, Partial Prerendering, and ongoing Vercel/Next.js optimizations target the App Router exclusively
+- **Better TypeScript support**: Generated types for route parameters, strongly-typed params via `PageProps<'/[lang]'>` helpers
+
+---
+
+## Migration Philosophy
+
+The migration follows three principles:
+
+1. **Incremental adoption**: The App Router is designed to coexist with Pages Router. Routes in `app/` and `pages/` run simultaneously, allowing gradual migration without feature flags or parallel deployments.
+
+2. **Risk isolation**: Each phase introduces one category of change. Version upgrades happen before structural changes. Route migration happens before advanced features.
+
+3. **Validation gates**: Each phase completes with verification steps before proceeding. Rollback paths remain available throughout.
+
+---
+
+## Phase 1: Version Upgrade Foundation
+
+### Objective
+Upgrade from Next.js 14.1.0 to Next.js 16 while remaining on Pages Router. This isolates version-related breaking changes from architectural changes.
+
+### Step 1.1: Pre-Migration Preparation
+
+**Ensure clean git state and create migration branch:**
+```bash
+git checkout -b feature/nextjs-16-upgrade
+```
+
+**Audit dependencies for React 19 / Next.js 16 compatibility:**
+- `@ninetailed/experience.js-next` - Verify React 19 support
+- `@segment/analytics-next` - Check for peer dependency conflicts
+- `styled-components` - Version 6+ recommended for React 19; version 5.x works but test thoroughly
+- `@contentful/live-preview` - Verify compatibility
+
+### Step 1.2: Run the Official Upgrade Codemod
+
+Next.js provides an automated upgrade tool that handles version bumps and applies codemods for breaking changes:
+
+```bash
+npx @next/codemod upgrade 16
+```
+
+This codemod performs:
+- Updates `next`, `react`, and `react-dom` to compatible versions
+- Prompts for applicable codemods based on detected patterns
+- Runs React 19 codemods if upgrading React
+
+**Reference:** [Next.js Codemods Documentation](https://nextjs.org/docs/app/guides/upgrading/codemods)
+
+### Step 1.3: Address Async Request APIs (Critical Breaking Change)
+
+**Next.js 15/16 makes Dynamic APIs asynchronous.** The following APIs that previously returned values synchronously now return Promises:
+
+- `cookies()` from `next/headers`
+- `headers()` from `next/headers`
+- `params` in page/layout props
+- `searchParams` in page props
+
+The codemod `next-async-request-api` attempts automatic migration:
+
+```bash
+npx @next/codemod@latest next-async-request-api .
+```
+
+**Manual verification required for:**
+- Middleware accessing cookies/headers
+- Any custom wrappers around these APIs
+- Type definitions that expect synchronous returns
+
+**Before:**
+```typescript
+import { cookies } from 'next/headers'
+const token = cookies().get('token')
+```
+
+**After:**
+```typescript
+import { cookies } from 'next/headers'
+const token = (await cookies()).get('token')
+```
+
+**Reference:** [Async Request APIs Migration](https://nextjs.org/docs/app/guides/upgrading/version-15#async-request-apis-breaking-change)
+
+### Step 1.4: Middleware to Proxy Migration (Next.js 16)
+
+Next.js 16 renames `middleware.js` to `proxy.js`. The functionality remains identical, but the naming change clarifies its purpose.
+
+Run the codemod:
+```bash
+npx @next/codemod@latest middleware-to-proxy .
+```
+
+This transforms:
+- `middleware.js` → `proxy.js`
+- Export `middleware` → export `proxy`
+- Config property `middlewarePrefetch` → `proxyPrefetch`
+
+**Impact on current architecture:** The `helper-routing/redirects.js` module exports a `handleRedirects` function that each app re-exports from their middleware. After migration, each app's `proxy.js` will re-export from the same module.
+
+**Reference:** [Middleware to Proxy Migration](https://nextjs.org/docs/app/api-reference/file-conventions/middleware#migration-to-proxy)
+
+### Step 1.5: Update next.config.js
+
+Review configuration options that changed or were removed:
+
+**Removed/Changed Options:**
+- `experimental.ppr` → Replaced by `cacheComponents` flag (for Phase 3)
+- `experimental.serverActions` → Now stable, remove the flag
+- Image optimization defaults changed in Next.js 13+
+
+**Recommended additions:**
+```javascript
+// next.config.js
+module.exports = {
+  // styled-components SSR support (already present, verify)
+  compiler: {
+    styledComponents: true,
+  },
+
+  // Retain for Pages Router during migration
+  // No changes required for existing rewrites/redirects
+}
+```
+
+### Step 1.6: Update Component Imports
+
+**Link Component:** The `<Link>` component no longer requires a child `<a>` tag. Run:
+```bash
+npx @next/codemod@latest new-link .
+```
+
+**Image Component:** If using legacy image imports, migrate:
+```bash
+npx @next/codemod@latest next-image-to-legacy-image .
+```
+
+### Phase 1 Risks and Breaking Changes
+
+| Risk | Impact | Mitigation |
+|------|--------|------------|
+| Async API changes break runtime | High | Codemod + thorough testing of middleware and data fetching |
+| Third-party package incompatibility | Medium | Test each dependency in isolation; create compatibility wrappers if needed |
+| styled-components SSR issues with React 19 | Medium | Test styled-components 5.x thoroughly; consider upgrade to v6 |
+| Build time regression | Low | Compare build times before/after; enable Turbopack if beneficial |
+
+### Phase 1 Validation Checklist
+
+- [ ] All apps build without errors
+- [ ] All apps run in development mode
+- [ ] Middleware/Proxy handles locale detection correctly
+- [ ] ISR revalidation functions as expected
+- [ ] Preview mode (Contentful) works
+- [ ] No console errors or React warnings
+- [ ] Lighthouse scores comparable to baseline
+- [ ] All automated tests pass
+
+---
+
+## Phase 2: Incremental Route Migration
+
+### Objective
+Migrate routes from `pages/` to `app/` incrementally, starting with simpler routes and progressing to the catch-all CMS routes. Pages Router and App Router coexist during this phase.
+
+### Migration Sequence Strategy
+
+**Recommended order (least to most complex):**
+1. Static pages (404, root redirect)
+2. API routes → Route Handlers
+3. Simple content pages
+4. Blog/news listing pages
+5. Blog/news detail pages with dynamic segments
+6. Main catch-all CMS route `[lang]/[[...slug]]`
+
+**Start with one app as pilot (suggested: `web-ads`)** - smallest surface area for validating patterns before applying across all apps.
+
+### Step 2.1: Create App Directory and Root Layout
+
+Create the `app/` directory at the same level as `pages/`:
+
+```
+packages/web-ads/
+├── app/                    # NEW
+│   └── layout.tsx          # Root layout (required)
+├── pages/                  # EXISTING (keep during migration)
+│   ├── _app.tsx
+│   ├── _document.js
+│   └── ...
+```
+
+**Root Layout replaces `_app.tsx` and `_document.tsx`:**
+
+The root layout must include `<html>` and `<body>` tags. It also hosts the provider stack currently in `_app.tsx`.
+
+```typescript
+// app/layout.tsx
+import { Metadata } from 'next'
+import StyledComponentsRegistry from '@/lib/styled-components-registry'
+import { Providers } from '@/components/providers'
+
+export const metadata: Metadata = {
+  // Default metadata - can be overridden per page
+}
+
+export default function RootLayout({
+  children,
+}: {
+  children: React.ReactNode
+}) {
+  return (
+    <html>
+      <body>
+        <StyledComponentsRegistry>
+          <Providers>
+            {children}
+          </Providers>
+        </StyledComponentsRegistry>
+      </body>
+    </html>
+  )
+}
+```
+
+**Reference:** [Root Layout Documentation](https://nextjs.org/docs/app/api-reference/file-conventions/layout#root-layout)
+
+### Step 2.2: styled-components Registry Setup
+
+Create a client component registry for styled-components SSR:
+
+```typescript
+// lib/styled-components-registry.tsx
+'use client'
+
+import React, { useState } from 'react'
+import { useServerInsertedHTML } from 'next/navigation'
+import { ServerStyleSheet, StyleSheetManager } from 'styled-components'
+
+export default function StyledComponentsRegistry({
+  children,
+}: {
+  children: React.ReactNode
+}) {
+  const [styledComponentsStyleSheet] = useState(() => new ServerStyleSheet())
+
+  useServerInsertedHTML(() => {
+    const styles = styledComponentsStyleSheet.getStyleElement()
+    styledComponentsStyleSheet.instance.clearTag()
+    return <>{styles}</>
+  })
+
+  if (typeof window !== 'undefined') return <>{children}</>
+
+  return (
+    <StyleSheetManager sheet={styledComponentsStyleSheet.instance}>
+      {children}
+    </StyleSheetManager>
+  )
+}
+```
+
+**Reference:** [CSS-in-JS with styled-components](https://nextjs.org/docs/app/guides/css-in-js#styled-components)
+
+### Step 2.3: Provider Stack Migration
+
+The current provider stack in `_app.tsx` includes context providers that often use React hooks. In App Router, context providers must be Client Components.
+
+Create a Providers wrapper:
+
+```typescript
+// components/providers.tsx
+'use client'
+
+import { ThemeProvider } from 'styled-components'
+import { WebsiteProvider } from '@doordash/dls'
+import { NinetailedProvider } from '@ninetailed/experience.js-next'
+import { AnalyticsProvider } from '@doordash/dls'
+// ... other providers
+
+export function Providers({ children }: { children: React.ReactNode }) {
+  return (
+    <WebsiteProvider>
+      <NinetailedProvider>
+        <AnalyticsProvider>
+          <ThemeProvider theme={theme}>
+            {children}
+          </ThemeProvider>
+        </AnalyticsProvider>
+      </NinetailedProvider>
+    </WebsiteProvider>
+  )
+}
+```
+
+**Important:** Keep providers as deep as possible in the tree. Only wrap what needs the context.
+
+### Step 2.4: Migrate API Routes to Route Handlers
+
+API Routes in `pages/api/` become Route Handlers in `app/api/`.
+
+**Before (`pages/api/form/submit.ts`):**
+```typescript
+import type { NextApiRequest, NextApiResponse } from 'next'
+
+export default async function handler(
+  req: NextApiRequest,
+  res: NextApiResponse
+) {
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method not allowed' })
+  }
+  // Handle form submission
+  res.status(200).json({ success: true })
+}
+```
+
+**After (`app/api/form/submit/route.ts`):**
+```typescript
+import { NextRequest } from 'next/server'
+
+export async function POST(request: NextRequest) {
+  // Handle form submission
+  return Response.json({ success: true })
+}
+
+// Optionally handle other methods
+export async function GET() {
+  return Response.json({ error: 'Method not allowed' }, { status: 405 })
+}
+```
+
+**Key differences:**
+- File convention: `route.ts` instead of arbitrary filename
+- Export named functions for HTTP methods: `GET`, `POST`, `PUT`, `DELETE`, etc.
+- Uses Web standard `Request`/`Response` APIs
+- `NextRequest` provides convenience methods like `nextUrl` and `cookies`
+
+**Reference:** [Route Handlers Documentation](https://nextjs.org/docs/app/api-reference/file-conventions/route)
+
+### Step 2.5: Migrate Internationalized Routes
+
+The current architecture uses `[lang]` dynamic segment for locale-prefixed URLs.
+
+**App Router i18n pattern:**
+
+```
+app/
+└── [lang]/
+    ├── layout.tsx          # Locale-specific layout
+    ├── page.tsx            # Locale homepage
+    └── [[...slug]]/
+        └── page.tsx        # Catch-all for CMS pages
+```
+
+**Locale layout with dictionary loading:**
+
+```typescript
+// app/[lang]/layout.tsx
+import { notFound } from 'next/navigation'
+import { getDictionary, hasLocale } from '@/lib/i18n/dictionaries'
+
+export async function generateStaticParams() {
+  return [
+    { lang: 'en-us' },
+    { lang: 'es-us' },
+    { lang: 'fr-ca' },
+    // Add other supported locales
+  ]
+}
+
+export default async function LocaleLayout({
+  children,
+  params,
+}: {
+  children: React.ReactNode
+  params: Promise<{ lang: string }>
+}) {
+  const { lang } = await params
+
+  if (!hasLocale(lang)) {
+    notFound()
+  }
+
+  const dictionary = await getDictionary(lang)
+
+  return (
+    <I18nProvider dictionary={dictionary} locale={lang}>
+      {children}
+    </I18nProvider>
+  )
+}
+```
+
+**Reference:** [Internationalization Guide](https://nextjs.org/docs/app/guides/internationalization)
+
+### Step 2.6: Migrate Data Fetching
+
+**`getStaticProps` → async Server Component:**
+
+**Before:**
+```typescript
+// pages/[lang]/[[...slug]].tsx
+export async function getStaticProps({ params, preview }) {
+  const page = await getContentfulPage({
+    slug: params.slug?.join('/') || '',
+    locale: params.lang,
+    preview,
+  })
+
+  return {
+    props: { page },
+    revalidate: 60,
+  }
+}
+
+export default function Page({ page }) {
+  return <SectionRenderer sections={page.sections} />
+}
+```
+
+**After:**
+```typescript
+// app/[lang]/[[...slug]]/page.tsx
+import { draftMode } from 'next/headers'
+import { notFound } from 'next/navigation'
+
+export default async function Page({
+  params,
+}: {
+  params: Promise<{ lang: string; slug?: string[] }>
+}) {
+  const { lang, slug } = await params
+  const { isEnabled: preview } = await draftMode()
+
+  const page = await getContentfulPage({
+    slug: slug?.join('/') || '',
+    locale: lang,
+    preview,
+  })
+
+  if (!page) {
+    notFound()
+  }
+
+  return <SectionRenderer sections={page.sections} />
+}
+```
+
+**`getStaticPaths` → `generateStaticParams`:**
+
+**Before:**
+```typescript
+export async function getStaticPaths() {
+  const paths = await getPathsForWebsiteV2({
+    websiteId: ContentfulWebsites.Mx,
+    locale: 'en-US',
+  })
+
+  return {
+    paths,
+    fallback: 'blocking',
+  }
+}
+```
+
+**After:**
+```typescript
+export async function generateStaticParams() {
+  const paths = await getPathsForWebsiteV2({
+    websiteId: ContentfulWebsites.Mx,
+    locale: 'en-US',
+  })
+
+  // Return format: array of { lang, slug } objects
+  return paths.map((path) => ({
+    lang: path.params.lang,
+    slug: path.params.slug,
+  }))
+}
+
+// Control fallback behavior
+export const dynamicParams = true // equivalent to fallback: 'blocking'
+```
+
+**Reference:** [generateStaticParams Documentation](https://nextjs.org/docs/app/api-reference/functions/generate-static-params)
+
+### Step 2.7: Migrate Preview Mode to Draft Mode
+
+**Before (Pages Router):**
+```typescript
+// pages/api/ui-preview.ts
+export default function handler(req, res) {
+  res.setPreviewData({})
+  res.redirect(req.query.slug || '/')
+}
+
+// In getStaticProps
+export async function getStaticProps({ preview }) {
+  // preview is boolean
+}
+```
+
+**After (App Router):**
+```typescript
+// app/api/draft/route.ts
+import { draftMode } from 'next/headers'
+import { redirect } from 'next/navigation'
+
+export async function GET(request: Request) {
+  const { searchParams } = new URL(request.url)
+  const slug = searchParams.get('slug') || '/'
+
+  ;(await draftMode()).enable()
+  redirect(slug)
+}
+
+// In page component
+import { draftMode } from 'next/headers'
+
+export default async function Page() {
+  const { isEnabled } = await draftMode()
+  // isEnabled is boolean
+}
+```
+
+### Step 2.8: Router Hooks Migration
+
+**`useRouter` from `next/router` → hooks from `next/navigation`:**
+
+| Pages Router | App Router |
+|--------------|------------|
+| `useRouter().push()` | `useRouter().push()` from `next/navigation` |
+| `useRouter().pathname` | `usePathname()` |
+| `useRouter().query` | `useSearchParams()` + `useParams()` |
+| `useRouter().asPath` | `usePathname()` + `useSearchParams()` |
+| `useRouter().locale` | Access via layout params or custom hook |
+| `useRouter().isReady` | Not needed in App Router |
+
+**Important:** `useRouter`, `usePathname`, `useSearchParams`, and `useParams` from `next/navigation` only work in Client Components.
+
+**Reference:** [useRouter API Reference](https://nextjs.org/docs/app/api-reference/functions/use-router)
+
+### Phase 2 Risks and Breaking Changes
+
+| Risk | Impact | Mitigation |
+|------|--------|------------|
+| Hard navigation between routers | Medium | Users navigating between `pages/` and `app/` routes experience full page reload. Minimize by migrating related routes together |
+| Context providers not available in Server Components | High | Audit component tree; mark interactive components with `'use client'` |
+| `useRouter` differences | Medium | Create compatibility layer or migrate incrementally |
+| styled-components in Server Components | High | All styled components must be in Client Components or use CSS variables |
+| SEO/metadata changes | Medium | Verify `generateMetadata` produces equivalent head tags |
+
+### Phase 2 Validation Checklist (Per Route)
+
+- [ ] Route renders correctly at all supported locales
+- [ ] Data fetching works (SSG/ISR behavior equivalent)
+- [ ] Preview/draft mode functions
+- [ ] Client-side navigation works
+- [ ] SEO metadata renders correctly
+- [ ] Analytics tracking fires
+- [ ] No hydration mismatches
+- [ ] Performance metrics comparable to baseline
+
+---
+
+## Phase 3: Cache Components and Advanced Features
+
+### Objective
+Enable Cache Components to unlock Partial Prerendering (PPR), `use cache` directive, and advanced caching capabilities. This phase introduces the most significant architectural changes.
+
+### Prerequisites
+
+- All routes migrated to App Router
+- Next.js 16 stable or canary
+- Thorough understanding of which components need dynamic behavior
+
+### Step 3.1: Enable Cache Components
+
+```typescript
+// next.config.ts
+import type { NextConfig } from 'next'
+
+const nextConfig: NextConfig = {
+  cacheComponents: true,
+}
+
+export default nextConfig
+```
+
+**What this enables:**
+- Partial Prerendering (PPR): Routes generate a static HTML shell at build time; dynamic content streams at request time
+- `use cache` directive: Fine-grained caching at component/function level
+- React `<Activity>` for preserved navigation state
+- New caching primitives: `cacheLife`, `cacheTag`, `revalidateTag`, `updateTag`
+
+**Reference:** [Cache Components Documentation](https://nextjs.org/docs/app/getting-started/cache-components)
+
+### Step 3.2: Understand the Rendering Model
+
+With Cache Components, Next.js categorizes content into three types:
+
+1. **Static content**: Synchronous operations, module imports, pure computations. Automatically included in the static shell.
+
+2. **Cached dynamic content**: Network requests or database queries wrapped with `use cache`. Executed at build time, results included in static shell, revalidated per `cacheLife` configuration.
+
+3. **Runtime dynamic content**: Operations requiring request context (`cookies()`, `headers()`, `searchParams`). Must be wrapped in `<Suspense>` with fallback UI.
+
+### Step 3.3: Migrate ISR to `use cache`
+
+The current ISR pattern (`revalidate: 60`) translates to `use cache` with `cacheLife`:
+
+**Before (Pages Router ISR):**
+```typescript
+export async function getStaticProps() {
+  const data = await fetchFromContentful()
+  return {
+    props: { data },
+    revalidate: 60,
+  }
+}
+```
+
+**After (Cache Components):**
+```typescript
+import { cacheLife } from 'next/cache'
+
+export default async function Page() {
+  'use cache'
+  cacheLife('minutes') // ~60 second revalidation
+
+  const data = await fetchFromContentful()
+  return <ContentRenderer data={data} />
+}
+```
+
+**Cache Life Profiles:**
+- `'seconds'`: Very short cache, frequent revalidation
+- `'minutes'`: Short cache (~60s), good for ISR replacement
+- `'hours'`: Medium cache
+- `'days'`: Long cache
+- `'weeks'`: Very long cache
+- `'max'`: Maximum cache duration
+
+**Custom cache configuration:**
+```typescript
+cacheLife({
+  stale: 60,      // Serve stale content for 60s
+  revalidate: 120, // Revalidate in background after 120s
+  expire: 3600,    // Hard expiration at 1 hour
+})
+```
+
+**Reference:** [cacheLife API Reference](https://nextjs.org/docs/app/api-reference/functions/cacheLife)
+
+### Step 3.4: Implement Cache Tagging for Contentful
+
+For CMS-driven content, use cache tags to enable on-demand revalidation when content updates:
+
+```typescript
+// lib/contentful.ts
+import { cacheTag } from 'next/cache'
+
+export async function getContentfulPage(slug: string, locale: string) {
+  'use cache'
+  cacheTag(`page:${slug}:${locale}`)
+  cacheTag('contentful-pages')
+
+  cacheLife('hours')
+
+  // Fetch from Contentful
+  return page
+}
+```
+
+**Revalidation via webhook:**
+```typescript
+// app/api/revalidate/route.ts
+import { revalidateTag } from 'next/cache'
+
+export async function POST(request: Request) {
+  const body = await request.json()
+
+  // Validate Contentful webhook signature
+  // ...
+
+  // Revalidate specific page
+  if (body.slug) {
+    revalidateTag(`page:${body.slug}:${body.locale}`)
+  }
+
+  // Or revalidate all pages
+  revalidateTag('contentful-pages')
+
+  return Response.json({ revalidated: true })
+}
+```
+
+**Reference:** [cacheTag and revalidateTag](https://nextjs.org/docs/app/api-reference/functions/cacheTag)
+
+### Step 3.5: Handle Personalization (Ninetailed)
+
+Ninetailed personalization requires runtime data (user context, cookies). This content cannot be cached with `use cache` and must stream at request time:
+
+```typescript
+import { Suspense } from 'react'
+import { cookies } from 'next/headers'
+
+// Static shell - cached
+async function PageShell() {
+  'use cache'
+  cacheLife('hours')
+
+  const page = await getContentfulPage()
+  return (
+    <>
+      <Header />
+      <HeroSection data={page.hero} />
+
+      {/* Dynamic personalized content */}
+      <Suspense fallback={<ContentSkeleton />}>
+        <PersonalizedContent pageId={page.id} />
+      </Suspense>
+
+      <Footer />
+    </>
+  )
+}
+
+// Runtime - not cached, streams at request time
+async function PersonalizedContent({ pageId }: { pageId: string }) {
+  const userCookies = await cookies()
+  const experienceId = userCookies.get('nt_experience')?.value
+
+  const personalizedData = await getNinetailedExperience(pageId, experienceId)
+  return <NinetailedSectionRenderer data={personalizedData} />
+}
+```
+
+### Step 3.6: Migrate Route Segment Configs
+
+Cache Components deprecates several route segment config options:
+
+| Deprecated | Replacement |
+|------------|-------------|
+| `dynamic = 'force-dynamic'` | Remove (default behavior) |
+| `dynamic = 'force-static'` | `use cache` with `cacheLife('max')` |
+| `revalidate = 60` | `cacheLife('minutes')` or custom config |
+| `fetchCache = 'force-cache'` | `use cache` on the component/function |
+
+### Step 3.7: Error Handling with Cache Components
+
+When Cache Components is enabled, Next.js requires explicit handling of components that can't prerender:
+
+```typescript
+// This will ERROR if DynamicContent accesses runtime APIs
+// without being wrapped in Suspense
+export default async function Page() {
+  'use cache'
+  return (
+    <div>
+      <StaticContent />
+      <DynamicContent /> {/* Error: Uncached data accessed outside Suspense */}
+    </div>
+  )
+}
+
+// CORRECT: Wrap dynamic content in Suspense
+export default async function Page() {
+  'use cache'
+  return (
+    <div>
+      <StaticContent />
+      <Suspense fallback={<Loading />}>
+        <DynamicContent />
+      </Suspense>
+    </div>
+  )
+}
+```
+
+### Phase 3 Risks and Breaking Changes
+
+| Risk | Impact | Mitigation |
+|------|--------|------------|
+| Runtime Edge not supported | High | Cache Components requires Node.js runtime. Remove any `runtime = 'edge'` configurations |
+| Components accessing runtime APIs error during build | High | Audit all components; wrap dynamic content in Suspense |
+| Ninetailed integration complexity | Medium | Carefully separate cached shell from personalized content |
+| Cache invalidation strategy changes | Medium | Test webhook-based revalidation thoroughly |
+| Performance regression if misconfigured | Medium | Monitor Core Web Vitals; use Suspense boundaries strategically |
+
+### Phase 3 Validation Checklist
+
+- [ ] Build completes without "Uncached data accessed" errors
+- [ ] Static shell generates at build time (check build output)
+- [ ] Dynamic content streams correctly at request time
+- [ ] Cache invalidation via Contentful webhooks works
+- [ ] Personalization (Ninetailed) functions correctly
+- [ ] Core Web Vitals improved or maintained
+- [ ] Time to First Byte (TTFB) improved for static content
+- [ ] Memory and CPU usage within acceptable bounds
+
+---
+
+## Shared Infrastructure Considerations
+
+### Package Updates
+
+The shared packages (`component-ui`, `dls`, `helper-contentful`, etc.) may need updates:
+
+1. **component-ui**: Components using `next/router` need compatibility updates. Consider creating an abstraction layer that works in both routers during migration.
+
+2. **helper-contentful**: Data fetching functions should be updated to support both `getStaticProps` pattern and direct `await` in Server Components.
+
+3. **helper-routing**: The `redirects.js` module works with both middleware and proxy conventions. Verify after Next.js 16 upgrade.
+
+### Vercel Configuration
+
+Update `vercel.json` if present:
+- Review `functions` configuration for Node.js runtime requirements
+- Update any `routes` configuration for new proxy behavior
+
+### Testing Strategy
+
+1. **Unit tests**: Update React Testing Library tests for Server Components (use `@testing-library/react` with `renderAsync` patterns)
+
+2. **Integration tests**: Test full route rendering including data fetching
+
+3. **E2E tests**: Verify user flows across router boundaries during migration
+
+4. **Visual regression**: Capture screenshots before/after for comparison
+
+---
+
+## Migration Order Recommendation
+
+### Suggested App Sequence
+
+1. **web-ads** (Pilot)
+   - Smallest surface area
+   - Fewer unique features
+   - Lower traffic for safe testing
+
+2. **web-ddfw**
+   - Similar structure to web-ads
+   - Business-focused content
+
+3. **web-corp**
+   - More complex (newsroom, legal pages)
+   - Higher visibility
+
+4. **web-dx**
+   - Additional locales (de-de, ja-jp)
+   - Gig locations feature
+
+5. **web-cx-blog**
+   - Blog-heavy architecture
+   - Good test for content patterns
+
+6. **web-mx** (Last)
+   - Most complex (Learning Center, multiple integrations)
+   - Highest traffic
+   - Most features to validate
+
+---
+
+## Documentation References
+
+### Official Next.js Documentation
+
+- [App Router Migration Guide](https://nextjs.org/docs/app/building-your-application/upgrading/app-router-migration)
+- [Server and Client Components](https://nextjs.org/docs/app/getting-started/server-and-client-components)
+- [Cache Components](https://nextjs.org/docs/app/getting-started/cache-components)
+- [Route Handlers](https://nextjs.org/docs/app/api-reference/file-conventions/route)
+- [generateStaticParams](https://nextjs.org/docs/app/api-reference/functions/generate-static-params)
+- [Internationalization](https://nextjs.org/docs/app/guides/internationalization)
+- [CSS-in-JS](https://nextjs.org/docs/app/guides/css-in-js)
+- [Codemods](https://nextjs.org/docs/app/guides/upgrading/codemods)
+- [Proxy (Middleware)](https://nextjs.org/docs/app/api-reference/file-conventions/middleware)
+
+### API References
+
+- [use cache directive](https://nextjs.org/docs/app/api-reference/directives/use-cache)
+- [cacheLife](https://nextjs.org/docs/app/api-reference/functions/cacheLife)
+- [cacheTag](https://nextjs.org/docs/app/api-reference/functions/cacheTag)
+- [revalidateTag](https://nextjs.org/docs/app/api-reference/functions/revalidateTag)
+- [draftMode](https://nextjs.org/docs/app/api-reference/functions/draft-mode)

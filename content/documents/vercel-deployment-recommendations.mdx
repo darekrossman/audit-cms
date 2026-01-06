@@ -1,0 +1,313 @@
+---
+id: "c9da964f-5744-4601-88ad-97c8aa3639af"
+title: "Vercel Deployment Recommendations"
+slug: "vercel-deployment-recommendations"
+description: "Analysis of current Vercel project settings with recommendations for build, runtime, and security configurations"
+createdAt: "2025-01-05T00:00:00.000Z"
+updatedAt: "2025-01-05T00:00:00.000Z"
+status: "published"
+tags: ["vercel", "deployment", "infrastructure"]
+order: 1
+---
+# Vercel Deployment Recommendations
+
+## Current Configuration
+
+This document analyzes the current Vercel project settings and provides recommendations for each configurable area.
+
+### Build Settings
+
+| Setting | Current Value | Status |
+|---------|---------------|--------|
+| On-Demand Concurrent Builds | Disabled | Builds queue when resources busy |
+| Build Machine | Standard (4 vCPUs, 8 GB) | Default tier |
+| Prioritize Production Builds | Enabled | Production deployments skip ahead |
+
+### Runtime Settings
+
+| Setting | Current Value | Status |
+|---------|---------------|--------|
+| Fluid Compute | Disabled | Traditional serverless execution |
+| Function CPU | Basic (0.6 vCPU, 1 GB)* | Legacy tier (removed June 2025) |
+| Node.js Version | 22.x | Current LTS |
+| Deployment Protection | Disabled | Preview URLs publicly accessible |
+| Skew Protection | Disabled* | No version locking between client/server |
+| Cold Start Prevention | Enabled | Functions pre-warmed |
+| Secure Compute | Primary iad1 | US East region |
+
+*Note: web-ads differs from other projects with Standard Function CPU (1 vCPU, 1.7 GB) and Skew Protection enabled (12 hours).
+
+---
+
+## Recommendation 1: Upgrade Function CPU from Basic to Standard
+
+### Current State
+Most projects run on **Basic** tier: 0.6 vCPU, 1 GB Memory. Exception: web-ads already uses Standard (1 vCPU, 1.7 GB).
+
+**Critical Update (June 2025)**: The Basic CPU instance has been **removed** from Vercel. Projects still configured with Basic will need to migrate. As of June 2025, memory and CPU instance sizes were updated with Fluid Compute:
+
+### What Changes
+
+| Tier | vCPU | Memory | Use Case |
+|------|------|--------|----------|
+| Basic (current) | 0.6 | 1 GB | **Removed** - no longer available |
+| **Standard** | 1 | 2 GB | Default for all plans |
+| Performance | 2 | 4 GB | SSR, latency-sensitive |
+
+### Benefit for This Project
+
+The web applications use `getStaticProps` and API routes that fetch from Contentful. More CPU and memory:
+
+- Faster JSON parsing of large Contentful payloads (especially with `include=5`)
+- Reduced function execution time during ISR revalidation
+- Better handling of concurrent requests to API routes
+
+### Configuration
+
+Project Settings → Functions → Advanced Settings → Function CPU
+
+**Reference**: [Configuring Memory and CPU](https://vercel.com/docs/functions/configuring-functions/memory)
+
+---
+
+## Recommendation 2: Enable Fluid Compute
+
+### Current State
+Fluid Compute is **Disabled**. Each function invocation runs in an isolated microVM.
+
+### What Fluid Compute Does
+
+Fluid Compute allows multiple invocations to share a single function instance. Instead of spinning up a new microVM per request:
+
+```
+Traditional:  Request 1 → VM 1
+              Request 2 → VM 2
+              Request 3 → VM 3
+
+Fluid:        Request 1 ─┐
+              Request 2 ─┼──> Single Instance
+              Request 3 ─┘
+```
+
+### Key Characteristics
+
+- **Optimized concurrency**: I/O-bound tasks (API calls to Contentful, Algolia) execute concurrently within one instance
+- **Bytecode caching**: JavaScript compiles once, reuses bytecode for subsequent invocations (Node.js 20+)
+- **Error isolation**: Unhandled errors don't crash concurrent requests
+- **No configuration required**: Preset defaults optimize for performance and cost
+
+### Benefit for This Project
+
+The web apps make heavy use of external API calls:
+- Contentful fetches during `getStaticProps` and ISR
+- Algolia queries for search
+- Form submissions
+
+These are I/O-bound operations that benefit from concurrent execution. Multiple requests waiting on Contentful API responses can share the same instance instead of each requiring a separate cold start.
+
+### Cost Impact
+
+Fluid Compute uses **Active CPU pricing**—charges only when code is actively executing, not while waiting on I/O. For workloads with significant idle time (waiting on API responses), this can reduce costs.
+
+### Configuration
+
+Project Settings → Functions → Fluid Compute → Enable
+
+**Reference**: [Fluid Compute Documentation](https://vercel.com/docs/functions/fluid-compute)
+
+---
+
+## Recommendation 3: Enable On-Demand Concurrent Builds
+
+### Current State
+On-Demand Concurrent Builds is **Disabled**. Builds enter a queue when resources are busy.
+
+- A change to `helper-contentful` triggers rebuilds across apps
+- Multiple team members deploying simultaneously queue builds
+- Preview deployments compete with production
+
+### How Build Queues Work Without This Setting
+
+- **Concurrency Queue**: Pro plans allow up to 12 simultaneous builds. When all slots are in use, new builds wait.
+- **Git Branch Queue**: Builds to the same branch run sequentially. If multiple commits occur, intermediate builds are skipped.
+
+### What On-Demand Concurrent Builds Does
+
+Eliminates build queueing by dynamically scaling build capacity. Two options:
+
+| Option | Behavior |
+|--------|----------|
+| Run all builds immediately | All builds proceed in parallel |
+| Run up to one build per branch | One active build per branch; different branches proceed immediately |
+
+### Benefit for This Project
+
+Enabling concurrent builds means deployments start immediately without waiting.
+
+### Configuration
+
+Project Settings → Build and Deployment → On-Demand Concurrent Builds
+
+**Reference**: [Build Queues Documentation](https://vercel.com/docs/builds/build-queues)
+
+---
+
+## Recommendation 4: Upgrade Build Machine to Enhanced
+
+### Current State
+Build Machine is **Standard**: 4 vCPUs, 8 GB Memory, 23 GB Disk.
+
+### Available Options
+
+| Machine | vCPUs | Memory | Disk | Cost (Pro) |
+|---------|-------|--------|------|------------|
+| Standard (current) | 4 | 8 GB | 23 GB | $0.014/min on-demand |
+| **Enhanced** | 8 | 16 GB | 56 GB | $0.030/min |
+| Turbo | 30 | 60 GB | 64 GB | $0.113/min |
+
+### Benefit for This Project
+
+The build bottlenecks identified in [BUILD_OPTIMIZATION_ANALYSIS.md](./BUILD_OPTIMIZATION_ANALYSIS.md) include:
+
+1. **Large Contentful payloads**: `include=5` creates deeply nested JSON that consumes memory during parsing
+2. **Concurrent page generation**: Next.js generates static pages in parallel during build
+3. **Algolia indexing**: Processes large record sets that can exceed 7MB
+
+Enhanced machines provide:
+- 2x memory (16 GB vs 8 GB): More headroom for large JSON payloads
+- 2x CPU (8 vCPUs vs 4): Faster parallel page generation
+- 2x disk (56 GB vs 23 GB): More space for build artifacts and caching
+
+**web-mx** at 19 minutes is the primary beneficiary. The Algolia 7MB errors occur because large payloads exhaust resources during indexing.
+
+### Configuration
+
+Project Settings → Build and Deployment → Build Machine Type
+
+**Reference**: [Managing Builds](https://vercel.com/docs/builds/managing-builds)
+
+---
+
+## Recommendation 5: Enable Deployment Protection
+
+### Current State
+Deployment Protection is **Disabled**. Preview URLs are publicly accessible.
+
+### What Deployment Protection Does
+
+Restricts access to preview and production deployments. Three methods available:
+
+| Method | Availability | Description |
+|--------|--------------|-------------|
+| Vercel Authentication | All plans | Requires Vercel account with project access |
+| Password Protection | Enterprise or Pro add-on | Shared password for access |
+| Trusted IPs | Enterprise only | IP allowlist |
+
+### Protection Levels
+
+| Level | What's Protected |
+|-------|------------------|
+| Standard Protection | All URLs except production custom domains |
+| All Deployments | Everything including production |
+
+### Benefit for This Project
+
+Preview deployments expose:
+- Unpublished content from Contentful preview API
+- Staging features before QA
+- Internal pages under development
+
+Without protection, anyone with a preview URL can access this content. Vercel Authentication (no additional cost) requires users to have Vercel account access to view previews.
+
+### Configuration
+
+Project Settings → Deployment Protection → Enable Standard Protection
+
+**Reference**: [Deployment Protection](https://vercel.com/docs/security/deployment-protection)
+
+---
+
+## Recommendation 6: Enable Skew Protection
+
+### Current State
+Skew Protection is **Disabled**. No version locking between client and server.
+
+### What Skew Protection Does
+
+Prevents version skew—when client and server run different versions of the application. This happens during deployments:
+
+1. User loads page (gets client bundle v1)
+2. New deployment goes live (server now v2)
+3. User interacts with page (client v1 sends request to server v2)
+4. Mismatch causes errors if data structures changed
+
+Skew Protection routes requests to the deployment version that matches the client:
+
+```
+Client v1 → Server v1 (old deployment)
+Client v2 → Server v2 (new deployment)
+```
+
+### Supported Frameworks
+
+Next.js 14.1.4+ has zero-configuration support. The current apps use Next.js 14.2.35, which is fully compatible with no configuration required.
+
+### Benefit for This Project
+
+The apps have frequent deployments across 6 projects. During active development:
+- Users mid-session may encounter errors when server API changes
+- Form submissions can fail if field structures change between client and server
+- ISR revalidation can cause stale/new version conflicts
+
+Skew Protection eliminates these edge cases without code changes.
+
+### Requirements
+
+- Next.js 14.1.4+ (current: 14.2.35 ✓)
+- "Automatically expose system environment variables" enabled
+- Redeploy after enabling
+
+**Note**: web-ads already has Skew Protection enabled (12 hours). Enable for remaining projects.
+
+### Configuration
+
+Project Settings → Advanced → Skew Protection
+
+**Reference**: [Skew Protection](https://vercel.com/docs/deployments/skew-protection)
+
+---
+
+## Summary of Current vs. Recommended
+
+| Setting | Current | Recommended | Impact |
+|---------|---------|-------------|--------|
+| Function CPU | Basic (0.6 vCPU, 1 GB)† | Standard (1 vCPU, 2 GB) | Faster function execution; **Required** - Basic removed |
+| Fluid Compute | Disabled | Enabled | Reduced cold starts, lower costs for I/O workloads |
+| On-Demand Concurrent Builds | Disabled | Enabled | Eliminate build queues |
+| Build Machine | Standard (4 vCPU, 8 GB) | Enhanced (8 vCPU, 16 GB) | Faster builds, headroom for large payloads |
+| Deployment Protection | Disabled | Standard Protection | Secure preview URLs |
+| Skew Protection | Disabled† | Enabled | Prevent client/server version mismatches |
+
+†web-ads already uses Standard Function CPU and has Skew Protection enabled (12 hours).
+
+### Settings Already Optimized
+
+| Setting | Current | Notes |
+|---------|---------|-------|
+| Prioritize Production Builds | Enabled | Production deployments skip preview queue |
+| Cold Start Prevention | Enabled | Functions pre-warmed |
+| Node.js Version | 22.x | Current LTS, good performance |
+| Secure Compute | iad1 | US East region appropriate for US traffic |
+
+---
+
+## References
+
+- [Fluid Compute](https://vercel.com/docs/functions/fluid-compute)
+- [Configuring Memory and CPU](https://vercel.com/docs/functions/configuring-functions/memory)
+- [Managing Builds](https://vercel.com/docs/builds/managing-builds)
+- [Build Queues](https://vercel.com/docs/builds/build-queues)
+- [Deployment Protection](https://vercel.com/docs/security/deployment-protection)
+- [Skew Protection](https://vercel.com/docs/deployments/skew-protection)
+- [Function CPU Defaults Changelog](https://vercel.com/changelog/faster-defaults-for-vercel-function-cpu-and-memory)
+- [Fluid Compute Defaults Changelog](https://vercel.com/changelog/higher-defaults-and-limits-for-vercel-functions-running-fluid-compute)

@@ -1,0 +1,541 @@
+---
+id: "3d01108c-7ac8-4f7b-949b-cb0cf3df4d50"
+title: "Cloudflare to Vercel Edge Migration"
+slug: "cloudflare-to-vercel-migration"
+description: "Assessment of migrating from a two-tier Cloudflare to Vercel architecture to Vercel-only"
+createdAt: "2025-01-05T00:00:00.000Z"
+updatedAt: "2025-01-05T00:00:00.000Z"
+status: "published"
+tags: ["cloudflare", "vercel", "migration", "infrastructure"]
+order: 2
+---
+# Cloudflare to Vercel Edge Migration
+
+## Overview
+
+This document assesses migrating the web applications from a two-tier Cloudflare → Vercel architecture to Vercel-only, eliminating Cloudflare as the front proxy layer.
+
+---
+
+## Current Architecture
+
+```
+Internet
+   │
+   ▼
+┌─────────────────────────────────────────────────────────┐
+│  CLOUDFLARE EDGE                                        │
+│  • TLS termination                                      │
+│  • WAF rules (Terraform-managed)                        │
+│  • DDoS protection                                      │
+│  • Workers (request routing)                            │
+│  • Bot detection (_cfuvid cookie)                       │
+└─────────────────────────────────────────────────────────┘
+   │
+   ▼
+┌─────────────────────────────────────────────────────────┐
+│  VERCEL                                                 │
+│  • Application hosting                                  │
+│  • ISR caching                                          │
+│  • Edge middleware                                      │
+│  • BotID (Kasada)                                       │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Current Cloudflare Components
+
+| Component | Purpose | Management |
+|-----------|---------|------------|
+| Workers (`worker-get-dd`) | Request routing to Vercel | `doordash/tf_cdn_cloudflare_workers` |
+| WAF Rules | Security policies | `doordash/tf_cdn_cloudflare` |
+| DDoS Protection | Attack mitigation | Cloudflare managed |
+| Stream | Video CDN | `@cloudflare/stream-react` |
+
+### Current Vercel Components
+
+| Component | Purpose |
+|-----------|---------|
+| BotID (Kasada) | Form protection |
+| Turnstile | Additional CAPTCHA (web-mx) |
+| Next.js Middleware | Locale detection, routing |
+| ISR | Page caching and revalidation |
+
+---
+
+## Production Request Analysis
+
+A captured request to `merchants.doordash.com/en-us` illustrates the current flow:
+
+### Request Path
+
+| Hop | Component | Evidence |
+|-----|-----------|----------|
+| 1 | **Cloudflare Edge** | IP: 104.18.35.30 (AS13335 CLOUDFLARENET) |
+| 2 | **Vercel Edge** | `x-vercel-id: iad1:iad1::...` |
+
+### What Cloudflare Is Doing
+
+| Function | Header/Evidence | Value |
+|----------|-----------------|-------|
+| TLS Termination | Client IP | Resolves to Cloudflare, not Vercel |
+| Proxy Pass-through | `cf-cache-status` | `DYNAMIC` (not caching) |
+| Bot Detection | `set-cookie` | `_cfuvid` (7-day visitor ID) |
+| Request Tagging | `cf-ray` | `9b849267fb35e644-IAD` |
+| Server Identification | `server` | `cloudflare` |
+
+### What Vercel Is Doing
+
+| Function | Header/Evidence | Value |
+|----------|-----------------|-------|
+| ISR Cache | `x-vercel-cache` | `HIT` |
+| Cache Level | `x-vercel-cache-level` | `regional` |
+| Content Age | `age` | `344506` (~4 days cached) |
+| Edge Runtime | `x-vercel-debug-handler-type` | `edge-runtime` |
+| Warm Function | `x-vercel-debug` | `start_type=hot` |
+
+### Latency Breakdown
+
+**Total: 136ms**
+
+| Phase | Time | Notes |
+|-------|------|-------|
+| Cloudflare proxy | ~10-20ms | Estimated overhead |
+| Vercel terminator | 65ms | Edge processing |
+| Router | 41ms | Request routing |
+| Lambda/Middleware | 27ms | Function execution |
+| Body transfer | 13ms | Compressed HTML |
+
+### Key Observation
+
+**Cloudflare is not caching**: `cf-cache-status: DYNAMIC`
+
+The HTML response passes through Cloudflare without caching. All caching happens at Vercel (`x-vercel-cache: HIT`). Cloudflare adds:
+- Bot detection cookie (`_cfuvid`)
+- Request headers (`cf-ray`, `server`)
+- Proxy latency (~10-20ms)
+
+---
+
+## Target Architecture
+
+```
+Internet
+   │
+   ▼
+┌─────────────────────────────────────────────────────────┐
+│  VERCEL EDGE                                            │
+│  • TLS termination                                      │
+│  • WAF (OWASP + Custom Rules)                           │
+│  • DDoS mitigation (automatic)                          │
+│  • Rate limiting                                        │
+│  • Bot protection                                       │
+│  • Edge middleware                                      │
+│  • ISR caching                                          │
+│  • BotID (Kasada)                                       │
+└─────────────────────────────────────────────────────────┘
+         │
+         └──── Cloudflare Stream (video only, direct embed)
+```
+
+---
+
+## Why Remove Cloudflare
+
+### Vercel's Position
+
+Vercel explicitly recommends against using reverse proxies in front of their platform. From the [official documentation](https://vercel.com/docs/security/reverse-proxy):
+
+> Vercel does not recommend placing a reverse proxy server in front of your Vercel project because it negatively impacts Vercel's firewall effectiveness.
+
+The [Cloudflare-specific guidance](https://vercel.com/kb/guide/cloudflare-with-vercel) states:
+
+> The biggest disadvantage is that Vercel no longer has full traffic visibility, which prevents the Vercel Firewall and their threat intelligence products from working to their full potential. This includes their ability to automatically challenge requests, prevent DDoS attacks, and more.
+
+### Documented Impacts
+
+According to Vercel's [reverse proxy documentation](https://vercel.com/docs/security/reverse-proxy), using a proxy in front of Vercel causes four specific issues:
+
+| Issue | Vercel Documentation |
+|-------|---------------------|
+| **Loss of traffic visibility** | "Vercel's CDN loses visibility into actual traffic, reducing firewall effectiveness in identifying suspicious activity" |
+| **IP address masking** | "Real end-user IP addresses cannot be accurately identified, breaking threat detection mechanisms" |
+| **Usage spike risk** | "If the reverse proxy undergoes a malicious attack, that traffic can be forwarded to Vercel, causing unexpected usage spikes" |
+| **Cache purge limitation** | "If the reverse proxy is compromised, Vercel's firewall cannot automatically purge the cache" |
+
+### Bot Protection Degradation
+
+From Vercel's [Cloudflare guidance](https://vercel.com/kb/guide/cloudflare-with-vercel):
+
+> Vercel discourages using reverse proxies (e.g., Cloudflare, Azure, or other CDNs) in front of Vercel when Bot Protection is enabled. This setup significantly degrades detection accuracy and performance, resulting in a poor end-user experience.
+
+Specific bot protection issues documented:
+- **Obscured detection signals**: "Legitimate users may be incorrectly challenged because the proxy masks signals that Bot Protection relies on"
+- **IP rotation interference**: "Some proxies rotate their exit node IPs frequently, forcing Vercel to re-initiate challenges on every IP change"
+
+### Additional Documented Concerns
+
+| Issue | Source |
+|-------|--------|
+| **Caching conflicts** | "Cloudflare and Vercel both have their own caching systems, which can cause unpredictable behavior" ([source](https://vercel.com/kb/guide/cloudflare-with-vercel)) |
+| **Analytics impact** | "Vercel sees Cloudflare's IP addresses, not the original visitor's IP. This impacts Vercel Analytics" ([source](https://vercel.com/kb/guide/cloudflare-with-vercel)) |
+| **Performance degradation** | "The additional proxy layer introduces latency, which degrades application performance" ([source](https://vercel.com/kb/guide/cloudflare-with-vercel)) |
+
+### What's Gained by Removing Cloudflare
+
+| Benefit | Description |
+|---------|-------------|
+| **Full traffic visibility** | Vercel threat intelligence and firewall operate at full effectiveness |
+| **Accurate bot detection** | BotID and Bot Protection receive unmasked client signals |
+| **Real IP addresses** | Analytics, geo-blocking, and rate limiting use actual visitor IPs |
+| **Reduced latency** | Eliminate proxy hop (~10-20ms observed in request analysis) |
+| **Simplified caching** | Single cache layer (Vercel ISR) with predictable behavior |
+| **Unified operations** | Single dashboard, consolidated billing, no Terraform repos |
+
+---
+
+## Vercel WAF Capabilities
+
+### Features
+
+| Feature | Capability |
+|---------|------------|
+| Custom Rules | Up to 1,000 |
+| IP Blocking (project) | Custom limits |
+| IP Blocking (account) | Custom limits |
+| Rate Limiting | Advanced (Token Bucket algorithm) |
+| Bot Protection Ruleset | Included |
+| AI Bots Ruleset | Included |
+| OWASP Core Ruleset | Included |
+| DDoS Mitigation | Automatic + dedicated support |
+
+### DDoS Protection
+
+- L3/L4/L7 protection
+- Automatic scaling during attacks
+- Attack Challenge Mode for enhanced verification
+- Dedicated support during large attacks
+- Blocked traffic not billed
+
+### Rate Limiting
+
+| Parameter | Capability |
+|-----------|------------|
+| Time Window | 10s - 1hr |
+| Counting Keys | IP, JA4, User Agent, Headers |
+| Algorithm | Fixed Window, Token Bucket |
+
+### Managed Rulesets
+
+**OWASP Core Ruleset**:
+- OWASP Top Ten coverage
+- SQLi, XSS, RCE protection
+- Per-rule Log or Deny actions
+
+**Bot Protection**:
+- JavaScript challenge for non-browser traffic
+
+**AI Bots**:
+- Block or log AI crawler traffic
+
+---
+
+## Vercel BotID (Kasada)
+
+### Overview
+
+BotID is Vercel's invisible bot detection solution powered by [Kasada](https://www.kasada.io/). It protects high-value routes (forms, checkouts, APIs) from automated attacks without CAPTCHAs or user friction.
+
+### How It Works
+
+```
+1. Client loads page → BotID injects obfuscated detection code
+2. User submits form → Browser includes challenge solution
+3. Server calls checkBotId() → Vercel validates with Kasada ML
+4. Pass/Fail verdict → Application allows or blocks request
+```
+
+Key characteristics:
+- **Invisible**: No CAPTCHAs, no user interaction required
+- **Adaptive**: Detection logic mutates on every page load to prevent reverse engineering
+- **ML-powered**: Kasada analyzes thousands of client-side signals
+- **Binary verdict**: Clear pass/fail (no scores or thresholds to tune)
+
+### Current Implementation
+
+BotID is already deployed across the web applications for form protection.
+
+**Client Component** (`packages/component-ui/src/forms/botId/botIdClient.tsx`):
+
+```typescript
+import { BotIdClient } from 'botid/client'
+
+const protectedRoutes = [
+  { path: '/api/form/captcha', method: 'POST' },
+]
+
+export const DoorDashBotIdClient = () => {
+  return <BotIdClient protect={protectedRoutes} />
+}
+```
+
+**Server Handler** (`packages/component-ui/src/forms/botId/botIdHelpers.ts`):
+
+```typescript
+import { checkBotId } from 'botid/server'
+
+export const checkBotIdHandler = async (req, res) => {
+  const verification = await checkBotId({
+    advancedOptions: {
+      extraAllowedHosts: [process.env.VERCEL_BOT_ID_ALLOWED_HOST],
+    },
+  })
+
+  if (verification.isBot) {
+    return res.status(403).json({
+      error: 'captcha',
+      error_type: verification.classificationReason
+    })
+  }
+
+  return res.status(200).json({ success: true })
+}
+```
+
+**Routing** (`next.config.js`):
+
+```javascript
+// BotID challenge endpoint
+{
+  source: "/:lang/149e9513-01fa-4fb0-aad4-566afd725d1b/.../c.js",
+  destination: "https://api.vercel.com/bot-protection/v1/challenge"
+}
+
+// BotID proxy endpoint
+{
+  source: "/:lang/149e9513-01fa-4fb0-aad4-566afd725d1b/:path*",
+  destination: "https://api.vercel.com/bot-protection/v1/proxy/:path*"
+}
+```
+
+**Environment Variables**:
+
+| Variable | Purpose |
+|----------|---------|
+| `NEXT_PUBLIC_VERCEL_BOT_ID_ENABLED` | Enable/disable BotID |
+| `VERCEL_BOT_ID_BYPASS` | Bypass for testing |
+| `VERCEL_BOT_ID_ALLOWED_HOST` | Additional allowed hosts (e.g., `merchants.doordash.com`) |
+
+### BotID with Vercel as Front Layer
+
+Reverse proxies [significantly degrade detection accuracy and performance](https://vercel.com/kb/guide/cloudflare-with-vercel) for bot protection. When Cloudflare is removed, BotID functionality improves:
+
+| Aspect | With Cloudflare Proxy | Vercel Direct | Source |
+|--------|----------------------|---------------|--------|
+| **Traffic visibility** | "Proxy masks signals that Bot Protection relies on" | Full client context
+| **Detection accuracy** | "Significantly degrades detection accuracy" | Optimal signal collection
+| **IP handling** | "Some proxies rotate exit node IPs frequently, forcing re-initiated challenges" | Stable client IP
+| **User experience** | "Poor end-user experience" due to false positives | Legitimate users pass smoothly
+
+### Bot Protection Stack Post-Migration
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  VERCEL BOT PROTECTION LAYERS                           │
+│                                                         │
+│  Layer 1: Vercel WAF Bot Protection Ruleset             │
+│           • JavaScript challenge for non-browser traffic│
+│           • Blocks obvious automated requests           │
+│                                                         │
+│  Layer 2: Vercel WAF AI Bots Ruleset                    │
+│           • Identifies AI crawlers                      │
+│           • Log or block AI bot traffic                 │
+│                                                         │
+│  Layer 3: BotID (Kasada Deep Analysis)                  │
+│           • Protects specific routes (forms, APIs)      │
+│           • ML-based behavioral analysis                │
+│           • Invisible to legitimate users               │
+│                                                         │
+│  Layer 4: Turnstile (web-mx only)                       │
+│           • Additional visible CAPTCHA for edge cases   │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Protected Routes
+
+Current BotID protection covers:
+
+| Route | Purpose |
+|-------|---------|
+| `/api/form/captcha` | Form submission validation |
+| `/api/form/submit` | Pardot form proxy |
+
+### Migration Impact
+
+**No changes required**: BotID is already a Vercel-native solution. Removing Cloudflare:
+- Eliminates redundant `_cfuvid` bot detection cookie
+- Improves BotID signal accuracy (no proxy interference)
+- Simplifies bot protection to a single vendor
+
+### Observability
+
+Post-migration, BotID metrics are available in:
+- **Vercel Dashboard**: Firewall tab → Traffic dropdown → Filter by "BotID"
+- **Observability Plus**: Detailed BotID check metrics and classifications
+
+---
+
+## Feature Migration Mapping
+
+### Direct Equivalents
+
+| Cloudflare | Vercel |
+|------------|--------|
+| Managed WAF Rules | OWASP Core Ruleset |
+| DDoS Protection | Automatic DDoS Mitigation |
+| Rate Limiting | Rate Limiting Rules |
+| Custom Rules | Custom WAF Rules (up to 1,000) |
+| IP Blocking | IP Blocking (project or account level) |
+
+### Requires Reimplementation
+
+| Cloudflare | Vercel Approach |
+|------------|-----------------|
+| Workers (routing) | Next.js Middleware |
+| Geographic routing | Edge Middleware or Edge Config |
+| Custom edge logic | Edge Middleware |
+
+### Not Available in Vercel
+
+| Cloudflare Feature | Alternative |
+|--------------------|-------------|
+| Stream video CDN | Keep Cloudflare Stream (direct) or migrate to Mux |
+| ML-based WAF scoring | OWASP ruleset provides pattern-based protection |
+| Credential leak detection | Application-level validation |
+
+---
+
+## Cloudflare Stream
+
+### Current Usage
+
+Hero videos embedded via `@cloudflare/stream-react`.
+
+### Post-Migration
+
+Cloudflare Stream operates independently of the proxy architecture. Videos can be embedded directly from Cloudflare's CDN:
+
+```
+Before: Client → Cloudflare Proxy → Vercel → (video from Stream)
+After:  Client → Vercel → (video direct from Stream CDN)
+```
+
+No migration required. Update embed URLs if currently routed through Workers.
+
+---
+
+## Migration Requirements
+
+### Prerequisites
+
+1. **Audit of existing rules** in `doordash/tf_cdn_cloudflare`
+2. **DNS access** to update records
+
+### Rules Audit
+
+Information needed from Terraform:
+
+| Rule Type | Count | Vercel Mapping |
+|-----------|-------|----------------|
+| IP blocks | ? | IP Blocking |
+| Rate limits | ? | Rate Limiting Rules |
+| Country blocks | ? | Custom Rule (geo condition) |
+| Header matches | ? | Custom Rule |
+| Bot challenges | ? | Bot Protection Ruleset |
+| OWASP rules | ? | OWASP Core Ruleset |
+
+### Migration Steps
+
+1. **Configure Vercel WAF** (parallel with existing):
+   - Enable OWASP Core Ruleset
+   - Create rate limiting rules
+   - Add IP blocking rules
+   - Create custom rules for specific patterns
+   - Enable in Log mode initially
+
+2. **Update DNS**:
+   - Point domains directly to Vercel
+   - Remove Cloudflare proxy (disable orange cloud)
+
+3. **Decommission Workers**:
+   - Remove `worker-get-dd`
+   - Traffic flows directly to Vercel
+
+4. **Validate**:
+   - Monitor Vercel Firewall logs
+   - Compare blocked traffic patterns
+   - Verify legitimate traffic not impacted
+
+5. **Cleanup**:
+   - Archive `doordash/tf_cdn_cloudflare`
+   - Archive `doordash/tf_cdn_cloudflare_workers`
+
+---
+
+## Before and After
+
+| Aspect | Current | After Migration |
+|--------|---------|-----------------|
+| **Edge Provider** | Cloudflare | Vercel |
+| **WAF** | Cloudflare (Terraform) | Vercel (Dashboard/API) |
+| **DDoS** | Cloudflare | Vercel (automatic) |
+| **Rate Limiting** | Cloudflare | Vercel |
+| **Bot Protection** | Cloudflare + BotID | Vercel Ruleset + BotID |
+| **Edge Routing** | Workers | Next.js Middleware |
+| **Video CDN** | Stream (proxied) | Stream (direct) |
+| **Terraform Repos** | 2 | 0 |
+| **Traffic Visibility** | Split | Unified |
+| **Latency** | +10-20ms proxy hop | Direct |
+
+---
+
+## Risks
+
+### OWASP Ruleset
+
+- Less granular than Cloudflare's rule engine
+- Test in Log mode before enabling Deny
+
+### Custom Rule Limits
+
+- Up to 1,000 rules available
+- Consolidate rules if Cloudflare count exceeds limits
+
+### Bot Management
+
+- Vercel's bot protection is less sophisticated than Cloudflare's ML-based system
+- BotID (Kasada) remains in place for form protection
+- Monitor for increased bot traffic post-migration
+
+---
+
+## References
+
+### Vercel Proxy & Security Guidance
+- [Reverse Proxy Servers and Vercel](https://vercel.com/docs/security/reverse-proxy) - Official documentation on proxy limitations
+- [Should I use Cloudflare in front of Vercel?](https://vercel.com/kb/guide/cloudflare-with-vercel) - Cloudflare-specific guidance and warnings
+- [Can I use a proxy on top of my Vercel Deployment?](https://vercel.com/kb/guide/can-i-use-a-proxy-on-top-of-my-vercel-deployment) - General proxy guidance
+
+### Vercel WAF & Firewall
+- [Vercel WAF](https://vercel.com/docs/security/vercel-waf)
+- [Managed Rulesets](https://vercel.com/docs/vercel-firewall/vercel-waf/managed-rulesets)
+- [Rate Limiting](https://vercel.com/docs/vercel-firewall/vercel-waf/rate-limiting)
+- [DDoS Mitigation](https://vercel.com/docs/security/ddos-mitigation)
+
+### Vercel BotID
+- [BotID Documentation](https://vercel.com/docs/botid)
+- [Introducing BotID](https://vercel.com/blog/introducing-botid)
+- [Kasada Partnership Announcement](https://www.kasada.io/kasada-and-vercel-launch-botid/)
+
+### Cloudflare
+- [WAF Overview](https://developers.cloudflare.com/waf/)
+- [Managed Rules](https://developers.cloudflare.com/waf/managed-rules/)

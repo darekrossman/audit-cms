@@ -10,6 +10,17 @@ function slugify(text: string): string {
     .replace(/\s+/g, '-')
 }
 
+function getTextContent(node: React.ReactNode): string {
+  if (typeof node === 'string') return node
+  if (typeof node === 'number') return String(node)
+  if (!node) return ''
+  if (Array.isArray(node)) return node.map(getTextContent).join('')
+  if (typeof node === 'object' && 'props' in node) {
+    return getTextContent((node as React.ReactElement).props.children)
+  }
+  return ''
+}
+
 function createHeading(level: 1 | 2 | 3 | 4 | 5 | 6) {
   const Tag = `h${level}` as const
   const sizes = {
@@ -22,20 +33,18 @@ function createHeading(level: 1 | 2 | 3 | 4 | 5 | 6) {
   }
 
   return function Heading({ children }: { children: React.ReactNode }) {
-    const text = typeof children === 'string' ? children : ''
+    const text = getTextContent(children)
     const id = slugify(text)
 
     return (
       <Tag id={id} className={cn('group scroll-mt-20', sizes[level])}>
+        {children}
         <a
           href={`#${id}`}
-          className="no-underline hover:underline"
+          className="ml-2 opacity-0 group-hover:opacity-50 transition-opacity no-underline"
           aria-label={`Link to ${text}`}
         >
-          {children}
-          <span className="ml-2 opacity-0 group-hover:opacity-50 transition-opacity">
-            #
-          </span>
+          #
         </a>
       </Tag>
     )

@@ -57,5 +57,6 @@ Uses Next.js Cache API with tags:
 
 - **Biome** for linting/formatting: single quotes, no semicolons, organized imports
 - **Path alias**: `@/*` maps to `./src/*`
-- **UI components**: shadcn/ui in `/src/components/ui/`
+- **UI components**: Base UI primitives (`@base-ui/react`) wrapped in `/src/components/ui/`
 - **Styling**: Tailwind CSS v4 with `cn()` utility for class merging
+- **Data attributes**: Components use `data-slot` for identification and `data-open`/`data-closed`/`data-selected` for state styling
