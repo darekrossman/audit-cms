@@ -4,7 +4,7 @@ const GITHUB_TOKEN = process.env.GITHUB_TOKEN
 const GITHUB_OWNER = process.env.GITHUB_OWNER
 const GITHUB_REPO = process.env.GITHUB_REPO
 const GITHUB_BRANCH = process.env.GITHUB_BRANCH ?? 'main'
-const GITHUB_CONTENT_PATH = process.env.GITHUB_CONTENT_PATH ?? 'documents'
+const GITHUB_CONTENT_PATH = process.env.GITHUB_CONTENT_PATH ?? 'content/documents'
 
 let octokitInstance: Octokit | null = null
 

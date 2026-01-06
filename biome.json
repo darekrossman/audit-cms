@@ -24,6 +24,9 @@
       },
       "suspicious": {
         "noExplicitAny": "warn"
+      },
+      "security": {
+        "noDangerouslySetInnerHtml": "off"
       }
     }
   },

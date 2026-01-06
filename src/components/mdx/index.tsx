@@ -2,6 +2,7 @@ import type { MDXComponents } from 'mdx/types'
 import Image from 'next/image'
 import Link from 'next/link'
 import { cn } from '@/lib/utils'
+import { Mermaid } from './mermaid'
 
 function slugify(text: string): string {
   return text
@@ -15,8 +16,9 @@ function getTextContent(node: React.ReactNode): string {
   if (typeof node === 'number') return String(node)
   if (!node) return ''
   if (Array.isArray(node)) return node.map(getTextContent).join('')
-  if (typeof node === 'object' && 'props' in node) {
-    return getTextContent((node as React.ReactElement).props.children)
+  if (node && typeof node === 'object' && 'props' in node) {
+    const element = node as { props: { children?: React.ReactNode } }
+    return getTextContent(element.props.children)
   }
   return ''
 }
@@ -124,16 +126,30 @@ export const mdxComponents: MDXComponents = {
       {children}
     </blockquote>
   ),
-  code: ({ children }) => (
-    <code className="bg-muted px-1.5 py-0.5 rounded text-sm font-mono">
-      {children}
-    </code>
-  ),
-  pre: ({ children }) => (
-    <pre className="my-4 p-4 rounded-lg overflow-x-auto bg-muted text-sm">
-      {children}
-    </pre>
-  ),
+  pre: ({ children, ...props }) => {
+    // Check if this is a mermaid code block
+    if (
+      children &&
+      typeof children === 'object' &&
+      'props' in children &&
+      children.props?.className?.includes('language-mermaid')
+    ) {
+      const chart =
+        typeof children.props.children === 'string'
+          ? children.props.children
+          : ''
+      return <Mermaid chart={chart} />
+    }
+
+    return (
+      <pre
+        className="my-4 p-4 rounded-lg overflow-x-auto bg-muted text-sm"
+        {...props}
+      >
+        {children}
+      </pre>
+    )
+  },
   hr: () => <hr className="my-8 border-border" />,
   table: ({ children }) => (
     <div className="my-4 overflow-x-auto">
@@ -173,4 +189,5 @@ export const mdxComponents: MDXComponents = {
     )
   },
   Callout,
+  MermaidDiagram: Mermaid,
 }

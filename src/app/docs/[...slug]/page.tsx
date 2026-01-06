@@ -3,8 +3,9 @@ import { notFound } from 'next/navigation'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Separator } from '@/components/ui/separator'
-import { renderDocument } from '@/lib/content/render'
+import { MDXContent } from '@/lib/content/render'
 import { listDocuments } from '@/lib/content/storage'
+import { getDocumentData } from '@/lib/data/document'
 
 interface PageProps {
   params: Promise<{ slug: string[] }>
@@ -23,13 +24,13 @@ export default async function DocumentPage({ params }: PageProps) {
   const { slug: slugParts } = await params
   const slug = slugParts.join('/')
 
-  const result = await renderDocument(slug)
+  const data = await getDocumentData(slug)
 
-  if (!result) {
+  if (!data) {
     notFound()
   }
 
-  const { metadata, Content } = result
+  const { metadata, content, formattedUpdatedAt } = data
 
   return (
     <div className="container mx-auto py-8 px-4 max-w-4xl">
@@ -66,18 +67,16 @@ export default async function DocumentPage({ params }: PageProps) {
               ))}
             </div>
           )}
-          <span>
-            Updated: {new Date(metadata.updatedAt).toLocaleDateString()}
-          </span>
+          <span>Updated: {formattedUpdatedAt}</span>
         </div>
       </div>
 
       <Separator className="mb-8" />
 
       {/* Content */}
-      <article className="prose prose-slate dark:prose-invert max-w-none">
-        {Content}
-      </article>
+      <div className="prose prose-slate dark:prose-invert max-w-none">
+        <MDXContent source={content} />
+      </div>
     </div>
   )
 }

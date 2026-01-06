@@ -1,7 +1,9 @@
-import { NextResponse } from 'next/server'
+import { connection, NextResponse } from 'next/server'
 import { getGitHubConfig, getOctokit } from '@/lib/github/client'
 
 export async function GET() {
+  await connection()
+
   try {
     const config = getGitHubConfig()
     const octokit = getOctokit()
