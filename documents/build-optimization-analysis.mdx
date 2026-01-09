@@ -6,7 +6,7 @@ description: >-
   Analysis of build performance issues and comprehensive optimization plan for
   the monorepo
 createdAt: '2025-01-05T00:00:00.000Z'
-updatedAt: '2026-01-09T22:42:47.815Z'
+updatedAt: '2026-01-09T22:42:51.127Z'
 status: published
 tags:
   - build
@@ -157,13 +157,6 @@ const homePage = await getBlogHomePage(
 **Problem**: Each blog post page makes 3-4 separate Contentful API calls during `getStaticProps`.
 
 **Data Flow** (from `packages/dls/src/content/blogPost.ts`):
-
-| Step | Function                     | Include Level |    |
-| ---- | ---------------------------- | ------------- | :- |
-| 1    | `getBlogHomePage()`          | 5 (GENERAL)   |    |
-| 2    | `getBlogPost()`              | 3 (GIG)       |    |
-| 3    | `getBlogMorePostsPreview()`  | 4 (BLOG)      |    |
-| 4    | `getItemDetailById()` (form) | 5 (GENERAL)   |    |
 
 **Estimated API Calls Per Full Build**:
 
