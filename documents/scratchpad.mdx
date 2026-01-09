@@ -1,0 +1,126 @@
+---
+id: 8c8a3b50-2df0-4f7c-ab9a-d31a738e8657
+title: Scratchpad
+slug: scratchpad
+description: Working notes and project configuration details
+createdAt: '2025-01-05T00:00:00.000Z'
+updatedAt: '2026-01-09T23:10:20.380Z'
+status: published
+tags:
+  - notes
+order: 99
+---
+## projects
+
+* web-mxBuild Settings:Runtime Settings:
+  * Next.js 14.2.35
+  - On-Demand Concurrent Builds: Disabled
+  - Build Machine: Standard performance (4 vCPUs, 8 GB Memory)
+  - Prioritize Production Builds: Enabled
+  * Fluid Compute: Disabled
+  * Deployment Protection: Disabled
+  * Secure Compute: Primary region is "iad1"
+  * Function CPU: Basic (0.6 vCPU, 1 GB Memory)
+  * Skew Protection: Disabled
+  * Node.js Version: 22.x
+  * Cold Start Prevention: Enabled
+* web-dxBuild Settings:Runtime Settings:
+  * Next.js 14.2.35
+  - On-Demand Concurrent Builds: Disabled
+  - Build Machine: Standard performance (4 vCPUs, 8 GB Memory)
+  - Prioritize Production Builds: Disabled
+  * Fluid Compute: Disabled
+  * Deployment Protection: Disabled
+  * Function CPU: Basic (0.6 vCPU, 1 GB Memory)
+  * Skew Protection: Disabled
+  * Node.js Version: 22.x
+  * Cold Start Prevention: Enabled
+* web-adsBuild Settings:Runtime Settings:
+  * Next.js 14.2.35
+  - On-Demand Concurrent Builds: Disabled
+  - Build Machine: Standard performance (4 vCPUs, 8 GB Memory)
+  - Prioritize Production Builds: Enabled
+  * Fluid Compute: Disabled
+  * Deployment Protection: Disabled
+  * Function CPU: Standard (1 vCPU, 1.7 GB Memory)
+  * Skew Protection: Enabled (12 hours)
+  * Node.js Version: 22.x
+  * Cold Start Prevention: Enabled
+* web-cx-blogBuild Settings:Runtime Settings:
+  * Next.js 14.2.35
+  - On-Demand Concurrent Builds: Disabled
+  - Build Machine: Standard performance (4 vCPUs, 8 GB Memory)
+  - Prioritize Production Builds: Disabled
+  * Fluid Compute: Disabled
+  * Deployment Protection: Disabled
+  * Function CPU: Basic (0.6 vCPU, 1 GB Memory)
+  * Skew Protection: Disabled
+  * Node.js Version: 22.x
+  * Cold Start Prevention: Enabled
+* web-corpBuild Settings:Runtime Settings:
+  * Next.js 14.2.35
+  - On-Demand Concurrent Builds: Disabled
+  - Build Machine: Standard performance (4 vCPUs, 8 GB Memory)
+  - Prioritize Production Builds: Disabled
+  * Fluid Compute: Disabled
+  * Deployment Protection: Disabled
+  * Function CPU: Basic (0.6 vCPU, 1 GB Memory)
+  * Skew Protection: Disabled
+  * Node.js Version: 22.x
+  * Cold Start Prevention: Enabled
+* web-ddfwBuild Settings:Runtime Settings:
+  * Next.js 14.2.35
+  - On-Demand Concurrent Builds: Disabled
+  - Build Machine: Standard performance (4 vCPUs, 8 GB Memory)
+  - Prioritize Production Builds: Disabled
+  * Fluid Compute: Disabled
+  * Deployment Protection: Disabled
+  * Function CPU: Basic (0.6 vCPU, 1 GB Memory)
+  * Skew Protection: Disabled
+  * Node.js Version: 22.x
+  * Cold Start Prevention: Enabled
+
+***
+
+## Audit context
+
+• 6 marketing sites in monorepo (merchants, dasher, about, advertising, blog, corporate)
+• Next.js 14 on Pages Router, Contentful CMS, Algolia search
+• Migrated from Cloudflare Pages but still using Cloudflare for WAF/firewall
+• Small team (2 engineers) with inherited legacy code
+
+### Focus Areas:
+
+1. Architecture review and optimization
+2. Build time improvements (merchants site has long builds - \~4500 pages)
+3. Performance optimization
+4. Vercel feature underutilization
+5. Cloudflare WAF migration assessment
+
+## Notes
+
+* possible to reuse built pages for locales where there is no difference, reducing duplicate generation?
+* enable fluid compute
+* enable larger build machine
+  * https://vercel.com/docs/builds/managing-builds#larger-build-machines
+  * https://vercel.com/docs/builds/managing-builds#enterprise-plan
+* add speed insights
+* feature flags for A/B testing?
+* app router migration
+  * server component architecture
+  * reduce clientside overhead
+  * granular caching
+  * improved DX
+* leverage PPR for personalization/dynamic combined with static pages (Next 16 w cache components)
+* move web apps to `apps/` directory
+* use vercel cli for env vars across team
+* web-mx-next looks like WIP migration
+
+cleanup ops
+
+```
+// Found in all web-* next.config.js - no longer needed?
+...(process.env.CF_PAGES === '1' && {
+  output: 'export',
+})
+```
