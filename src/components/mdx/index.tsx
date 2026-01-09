@@ -43,7 +43,7 @@ function createHeading(level: 1 | 2 | 3 | 4 | 5 | 6) {
         {children}
         <a
           href={`#${id}`}
-          className="ml-2 opacity-0 group-hover:opacity-50 transition-opacity no-underline"
+          className="ml-2 invisible group-hover:visible text-muted-foreground/50 no-underline"
           aria-label={`Link to ${text}`}
         >
           #
