@@ -1,0 +1,742 @@
+---
+id: 6af4c61c-3143-4931-92c4-401ff630fac6
+title: Build Optimization Analysis
+slug: build-optimization-analysis
+description: >-
+  Analysis of build performance issues and comprehensive optimization plan for
+  the monorepo
+createdAt: '2025-01-05T00:00:00.000Z'
+updatedAt: '2026-01-09T22:42:14.774Z'
+status: published
+tags:
+  - build
+  - optimization
+  - performance
+order: 4
+---
+# Build Optimization Analysis
+
+## Overview
+
+This analysis examines build performance issues across all web applications in the monorepo and provides a comprehensive optimization plan covering code-level fixes, infrastructure enhancements, and tooling upgrades.
+
+**Current State**: Next.js 14.2.35, pnpm workspaces, no task runner, Webpack bundler
+
+***
+
+## Current Build Times
+
+| Application     | Build Time | Primary Bottlenecks                                    |
+| --------------- | ---------- | ------------------------------------------------------ |
+| **web-mx**      | \~19 min   | Algolia 7MB errors, deep includes, homepage redundancy |
+| **web-cx-blog** | \~10 min   | Homepage redundancy (\~9,774 fetches), deep includes   |
+| **web-corp**    | \~6 min    | Include depth, API call volume                         |
+| **web-dx**      | \~5 min    | Include depth, API call volume                         |
+| **web-ddfw**    | \~3 min    | Include depth                                          |
+| **web-ads**     | \~1.5 min  | Minimal issues                                         |
+
+***
+
+# Part 1: Identified Bottlenecks
+
+## 1.1 MAX\_RECORDS \= 750 Causing API Response Size Errors
+
+**Problem**: Contentful API responses can exceed the 7MB limit when fetching 750 records with resolved references.
+
+**Locations**:
+
+| File                                           | Line | Value                     |
+| ---------------------------------------------- | ---- | ------------------------- |
+| `packages/helper-contentful/src/contentful.ts` | 74   | `const MAX_RECORDS = 750` |
+| `shared-contentful-helpers.js`                 | 4    | `const MAX_RECORDS = 750` |
+
+**Root Cause**: Algolia build scripts call `getPagesForAlgolia()` with `include: 3`:
+
+```javascript
+// shared-contentful-helpers.js:244-264
+async function getPagesForAlgolia(websiteId, locale, includeContent, overrideConfig) {
+  const results = await getPagedRecords({
+    content_type: 'page',
+    include: includeContent ? 3 : 1,  // 3 levels of nested references
+    ...
+  })
+}
+```
+
+When `includeContent: true`, fetching 750 pages with 3 levels of nested references exceeds Contentful's 7MB response limit.
+
+**Impact**: Build failures during Algolia indexing (primarily affects web-mx due to content volume).
+
+***
+
+## 1.2 Deep Include Levels Causing Circular References
+
+**Problem**: Include levels of 4-5 resolve excessive nested references, creating circular dependency chains and bloated payloads.
+
+**Location**: `packages/helper-contentful/src/contentful.ts:63-72`
+
+```typescript
+export enum ContentfulIncludeLevelEnum {
+  GENERAL = 5,   // Deep nesting - PRIMARY ISSUE
+  CATEGORY = 4,
+  TOPIC = 4,
+  PAGE = 5,      // Deep nesting - PRIMARY ISSUE
+  BLOG = 4,
+  GIG = 3,
+  LINKS = 2,
+  BASE = 0,
+}
+```
+
+**Circular Reference Chain**:
+
+```
+Page (include=5)
+  -> UISection (level 1)
+    -> UIButton with href to another Page (level 2)
+      -> That Page's sections (level 3)
+        -> More buttons/links (level 4)
+          -> More pages (level 5) <- CIRCULAR BACK TO ORIGINAL
+```
+
+**Content Type Relationships Causing Cycles**:
+
+| Cycle                    | Path                                                                             |
+| ------------------------ | -------------------------------------------------------------------------------- |
+| Page -> Section -> Page  | Pages contain UIMulticolumnSection which can embed buttons linking back to pages |
+| Blog -> Category -> Blog | Blog posts reference categories; categories can reference featured blog posts    |
+| Blog -> Topic -> Blog    | Topics link to all posts using that topic via `links_to_entry` queries           |
+
+**Impact**:
+
+* JSON payloads bloated with redundant nested data
+* Memory pressure during build
+* Potential serialization errors in Next.js SSG
+* Slow page generation
+
+***
+
+## 1.3 Redundant Homepage Fetching
+
+**Problem**: Every blog/learning-center post page fetches the homepage separately with no deduplication across the build.
+
+**Location**: `packages/dls/src/content/blogPost.ts:37-54`
+
+```typescript
+const homePage = await getBlogHomePage(
+  options.websiteId,
+  locale,
+  isPreview,
+  '',
+  ContentfulIncludeLevelEnum.GENERAL,  // include=5 (EXCESSIVE)
+  [
+    'sys.id', 'sys.contentType', 'fields.title',
+    'fields.metaDescription', 'fields.website',
+    'fields.shortName', 'fields.formOverride',
+    'fields.categories', 'fields.blogSignupForm',
+  ]
+)
+```
+
+**Homepage Fetch Redundancy by App**:
+
+| App         | Blog Posts | Locales | Homepage Fetches | Should Be |
+| ----------- | ---------- | ------- | ---------------- | --------- |
+| web-cx-blog | \~1,570    | 6       | \~9,420          | 6         |
+| web-mx      | \~200      | 6       | \~1,200          | 6         |
+| web-corp    | \~100      | 6       | \~600            | 6         |
+| web-dx      | \~50       | 6       | \~300            | 6         |
+
+**Impact**: Massive API call overhead during build.
+
+***
+
+## 1.4 Multiple API Calls Per Page
+
+**Problem**: Each blog post page makes 3-4 separate Contentful API calls during `getStaticProps`.
+
+**Data Flow** (from `packages/dls/src/content/blogPost.ts`):
+
+| Step | Function                     | Include Level |
+| ---- | ---------------------------- | ------------- |
+| 1    | `getBlogHomePage()`          | 5 (GENERAL)   |
+| 2    | `getBlogPost()`              | 3 (GIG)       |
+| 3    | `getBlogMorePostsPreview()`  | 4 (BLOG)      |
+| 4    | `getItemDetailById()` (form) | 5 (GENERAL)   |
+
+**Estimated API Calls Per Full Build**:
+
+| App         | Blog Pages | Catch-all Pages | Category/Other | Total API Calls |
+| ----------- | ---------- | --------------- | -------------- | --------------- |
+| web-cx-blog | \~37,680   | \~600           | \~1,000        | **\~39,000**    |
+| web-mx      | \~4,800    | \~600           | \~200          | **\~5,600**     |
+| web-corp    | \~2,400    | \~300           | \~100          | **\~2,800**     |
+| web-dx      | \~1,200    | \~300           | \~100          | **\~1,600**     |
+
+***
+
+## 1.5 Build Log Noise
+
+**Problem**: Excessive logging during builds obscures important warnings and errors.
+
+### "No Default Form Configured" Messages
+
+**Location**: `packages/dls/src/content/blogPost.ts:100`
+
+```typescript
+console.log(`[Blog Post Build] No default form configured. slug="${slug}", locale="${locale}"`)
+```
+
+| App         | Has Default Form          | Log Messages/Build |
+| ----------- | ------------------------- | ------------------ |
+| web-mx      | Yes (SSMOFormDefault)     | Fewer              |
+| web-cx-blog | No                        | \~9,420            |
+| web-corp    | No                        | \~600              |
+| web-dx      | Yes (DasherSelfServeForm) | Fewer              |
+
+### i18n Translation File Warnings
+
+**Location**: `packages/web-cx-blog/lib/pageHelpers.ts:23`
+
+```typescript
+console.error('Unable to find locale file: ', error.message)
+```
+
+**Combined Noise Impact** (web-cx-blog):
+
+```
+"No default form": ~9,420
+i18n warnings:     ~4,890
+─────────────────────────
+TOTAL:            ~14,310 messages
+```
+
+***
+
+## 1.6 No Build Caching or Task Orchestration
+
+**Problem**: The monorepo uses pnpm workspaces without a task runner.
+
+```yaml
+# pnpm-workspace.yaml
+packages:
+  - 'packages/*'
+```
+
+Each `pnpm -F 'web-*' run build` rebuilds from scratch with no caching between builds or across CI runs.
+
+***
+
+# Part 2: Recommendations
+
+## Priority Summary
+
+| Priority | Category | Fix                               | Effort | Impact                      |
+| -------- | -------- | --------------------------------- | ------ | --------------------------- |
+| **P0**   | Code     | Reduce MAX\_RECORDS to 100        | Low    | High - Fixes build failures |
+| **P0**   | Code     | Reduce GENERAL/PAGE include to 3  | Low    | High - All apps             |
+| **P0**   | Infra    | Vercel Enhanced Build Machines    | Config | High - 2x resources         |
+| **P1**   | Code     | blogPost homePage include → LINKS | Low    | Medium                      |
+| **P1**   | Code     | Homepage caching during build     | Medium | High                        |
+| **P1**   | Infra    | Turborepo + Remote Caching        | Medium | High - Skip rebuilds        |
+| **P2**   | Code     | Reduce build log noise            | Low    | Debugging                   |
+| **P2**   | Infra    | Next.js 15 + Turbopack (dev)      | Medium | Dev speed                   |
+| **P3**   | Infra    | Next.js 16 + Turbopack (build)    | High   | Build speed                 |
+
+***
+
+## Code-Level Fixes
+
+### Fix 1: Reduce MAX\_RECORDS from 750 to 100
+
+**Change Locations**:
+
+* `packages/helper-contentful/src/contentful.ts:74`
+* `shared-contentful-helpers.js:4`
+
+**Impact**:
+
+| Metric                  | Before (750) | After (100) | Change    |
+| ----------------------- | ------------ | ----------- | --------- |
+| Records per API request | 750          | 100         | -87%      |
+| Estimated response size | 7MB+         | \~1MB       | -85%      |
+| API calls for 500 items | 1            | 5           | +400%     |
+| 7MB limit exceeded      | Frequent     | Never       | **Fixed** |
+
+**Risk**: More API calls needed, but each stays within limits.
+
+**Priority**: **P0** - Directly fixes Algolia build failures.
+
+***
+
+### Fix 2: Reduce GENERAL and PAGE from 5 to 3
+
+**Change Location**: `packages/helper-contentful/src/contentful.ts:63-67`
+
+```typescript
+// Before
+GENERAL = 5,
+PAGE = 5,
+
+// After
+GENERAL = 3,
+PAGE = 3,
+```
+
+**Impact**:
+
+| Metric                   | Include\=5 | Include\=3 | Change    |
+| ------------------------ | ---------- | ---------- | --------- |
+| Nesting depth            | 5 levels   | 3 levels   | -40%      |
+| Avg payload size         | \~150KB    | \~50KB     | -67%      |
+| Circular ref probability | High       | Low        | -80%      |
+| Build memory usage       | High       | Moderate   | -50% est. |
+
+**Risk**: Low - most UI sections only need 2-3 levels of nesting.
+
+**Priority**: **P0** - High impact across all apps.
+
+***
+
+### Fix 3: Reduce blogPost Homepage Include to LINKS (2)
+
+**Change Location**: `packages/dls/src/content/blogPost.ts:42`
+
+```typescript
+// Before
+ContentfulIncludeLevelEnum.GENERAL,  // 5
+
+// After
+ContentfulIncludeLevelEnum.LINKS,    // 2
+```
+
+**Rationale**: The `select` clause already limits returned fields - deep includes are unnecessary.
+
+**Priority**: **P1** - Safe change, benefits all apps with blogs.
+
+***
+
+### Fix 4: Implement Homepage Caching During Build
+
+**Problem**: \~9,774+ redundant homepage fetches during builds.
+
+**Solution**: Cache homepage per locale at build start:
+
+```typescript
+const homepageCache = new Map<string, ContentfulBlogHomepage>()
+
+async function getCachedBlogHomepage(websiteId: string, locale: string, isPreview: boolean) {
+  const cacheKey = `${websiteId}_${locale}`
+  if (!homepageCache.has(cacheKey)) {
+    const homepage = await getBlogHomePage(websiteId, locale, isPreview, '', ContentfulIncludeLevelEnum.LINKS)
+    homepageCache.set(cacheKey, homepage)
+  }
+  return homepageCache.get(cacheKey)
+}
+```
+
+**Impact**: Reduce homepage API calls from thousands to 6 (one per locale).
+
+**Priority**: **P1** - High impact for blog-heavy apps.
+
+**Note**: This manual caching would be superseded by Next.js 16 Cache Components (`"use cache"` directive).
+
+***
+
+### Fix 5: Reduce Build Log Noise
+
+**Changes**:
+
+1. **Gate "No default form" log** (`blogPost.ts:100`):
+   ```typescript
+   if (process.env.DEBUG_BUILD === 'true') {
+     console.log(`[Blog Post Build] No default form configured...`)
+   }
+   ```
+2. **Suppress expected i18n warnings** (app-specific `pageHelpers.ts`):
+   ```typescript
+   const supportedLocales = ['en-us', 'es-us', 'fr-ca']  // App-specific
+   if (supportedLocales.includes(localeToLoad.toLowerCase())) {
+     // Only attempt import for supported locales
+   }
+   ```
+
+**Priority**: **P2** - Improves debugging experience.
+
+***
+
+## Infrastructure Enhancements
+
+### Enhancement 1: Vercel Enhanced Build Machines
+
+Enhanced machines provide 2x the resources of standard machines:
+
+| Machine Type | vCPUs | Memory | Disk  | Cost (Pro)           |
+| ------------ | ----- | ------ | ----- | -------------------- |
+| Standard     | 4     | 8 GB   | 23 GB | $0.014/min on-demand |
+| **Enhanced** | 8     | 16 GB  | 56 GB | $0.030/min           |
+| Turbo        | 30    | 60 GB  | 64 GB | $0.113/min           |
+
+**Relevance**: The deep Contentful includes cause memory pressure. Enhanced machines provide headroom for large payloads during static generation.
+
+**Configuration**: Project Settings → Build and Deployment → Build Machine Type
+
+**Priority**: **P0** - Configuration change only, immediate benefit.
+
+***
+
+### Enhancement 2: Turborepo Integration
+
+**What Turborepo Provides**:
+
+* **Incremental builds**: Only rebuilds changed packages
+* **Remote caching**: Share build artifacts across CI runs and team members (automatic on Vercel)
+* **Task orchestration**: Parallel execution with dependency awareness
+
+**Proposed Configuration** (`turbo.json`):
+
+```json
+{
+  "$schema": "https://turbo.build/schema.json",
+  "globalDependencies": [".env", ".nvmrc"],
+  "globalEnv": [
+    "NODE_ENV",
+    "CONTENTFUL_SPACE_ID",
+    "CONTENTFUL_DELIVERY_API_KEY",
+    "CONTENTFUL_PREVIEW_API_KEY",
+    "ALGOLIA_APP_ID",
+    "ALGOLIA_ADMIN_KEY"
+  ],
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],
+      "outputs": [".next/**", "!.next/cache/**"],
+      "env": ["WEBSITE_ID", "ANALYZE", "CF_PAGES"]
+    },
+    "dev": {
+      "cache": false,
+      "persistent": true
+    },
+    "test": {
+      "dependsOn": ["^build"],
+      "outputs": ["coverage/**"]
+    }
+  }
+}
+```
+
+**Migration Steps**:
+
+1. Install Turborepo:
+   ```bash
+   pnpm add -D turbo -w
+   ```
+2. Add `turbo.json` to root
+3. Update `package.json` scripts:
+   ```json
+   {
+     "scripts": {
+       "build": "turbo run build",
+       "build:web-mx": "turbo run build --filter=web-mx",
+       "dev:web-mx": "turbo run dev --filter=web-mx"
+     }
+   }
+   ```
+4. For local development, authenticate for remote cache:
+   ```bash
+   npx turbo login
+   npx turbo link
+   ```
+
+**Priority**: **P1** - Medium effort, high impact for CI/CD.
+
+***
+
+### Enhancement 3: Next.js Upgrade + Turbopack
+
+**Turbopack Timeline**:
+
+| Version                   | Turbopack Status     | Notes                                       |
+| ------------------------- | -------------------- | ------------------------------------------- |
+| Next.js 15 (Oct 2024)     | Dev stable           | `next dev --turbo` ready for production use |
+| Next.js 15.3 (Apr 2025)   | Build alpha          | 99% test pass rate; staging/preview only    |
+| Next.js 15.5 (Aug 2025)   | Build beta           | 2-5x faster builds                          |
+| **Next.js 16 (Oct 2025)** | **Stable & default** | No flags needed                             |
+
+**Current vs. Target**:
+
+| Aspect        | Current (14.2.35) | Target (16.x)         |
+| ------------- | ----------------- | --------------------- |
+| Bundler       | Webpack           | Turbopack (default)   |
+| Build caching | None              | File system cache     |
+| Development   | Webpack HMR       | Turbopack incremental |
+
+**Turbopack Characteristics**:
+
+* Incremental computation with function-level caching
+* Lazy bundling (only bundles what's requested)
+* File system caching persists compiled artifacts across builds
+
+**webpack to Turbopack Migration**:
+
+Current `next.config.js` uses custom webpack:
+
+```javascript
+// packages/web-mx/next.config.js
+webpack: (config) => {
+  config.module.rules.push({
+    test: /@doordash\//,
+    sideEffects: false,
+  })
+  return config
+}
+```
+
+Turbopack equivalent:
+
+```javascript
+const nextConfig = {
+  turbopack: {
+    rules: {
+      // Turbopack uses loaders instead of webpack plugins
+    },
+  },
+  // Tree-shaking is automatic in Turbopack
+}
+```
+
+**Upgrade Path** (incremental adoption):
+
+1. **Now (14.2.35 → 15.x)**: Upgrade to Next.js 15, enable `next dev --turbo` for development
+2. **After testing**: Try `next build --turbopack` in staging/preview (beta in 15.5+)
+3. **Full migration**: Upgrade to Next.js 16 where Turbopack is default
+
+```bash
+# Next.js 15: Test Turbopack incrementally
+next dev --turbo         # Development (stable)
+next build --turbopack   # Production builds (beta in 15.5+)
+
+# Fallback available in Next.js 15
+next dev --webpack
+next build --webpack
+
+# Next.js 16: Turbopack is default, no flags needed
+next dev
+next build
+```
+
+**Compatibility Notes**:
+
+**Supported**:
+
+* Styled Components (`compiler.styledComponents: true`)
+* SASS/SCSS
+* CSS Modules
+* TypeScript/JSX
+* Bundle analyzer
+
+**Requires attention**:
+
+* Custom webpack rules need conversion to Turbopack loaders
+* `transpilePackages` behavior may differ
+* Some webpack plugins may not have equivalents
+
+**Priority**: **P2-P3** - Medium-high effort, significant long-term benefit.
+
+***
+
+### Enhancement 4: Next.js 16 Static Generation Improvements
+
+**Single-Pass Static Generation**: Next.js 16 reuses the first render instead of rendering twice (once for data, once for HTML).
+
+**Shared Fetch Cache**: Static generation workers share fetch cache across pages:
+
+```
+Current: 1,570 posts × 6 locales × 4 API calls = ~37,680 calls
+With shared cache: ~6 homepage calls + ~1,570 unique post calls = ~1,576 calls
+```
+
+**Cache Components** (`"use cache"` directive):
+
+```typescript
+async function getCachedBlogHomepage(websiteId: string, locale: string) {
+  "use cache"
+  cacheLife('hours')
+  cacheTag(`homepage-${locale}`)
+  return await getBlogHomePage(websiteId, locale)
+}
+```
+
+This would replace manual homepage caching (Fix 4) with a framework-native solution.
+
+***
+
+# Part 3: Files Requiring Modification
+
+| File                                           | Changes                                       | Apps Affected  |
+| ---------------------------------------------- | --------------------------------------------- | -------------- |
+| `packages/helper-contentful/src/contentful.ts` | Lines 63-72 (enum), Line 74 (MAX\_RECORDS)    | All            |
+| `shared-contentful-helpers.js`                 | Line 4 (MAX\_RECORDS), Line 248 (batch logic) | All            |
+| `packages/dls/src/content/blogPost.ts`         | Line 42 (include level), Line 100 (log)       | All with blogs |
+| App-specific `pageHelpers.ts`                  | i18n warning suppression                      | Per app        |
+| Root `turbo.json`                              | New file                                      | All            |
+| Root `package.json`                            | Script updates for Turborepo                  | All            |
+
+***
+
+# Part 4: Expected Impact
+
+## Build Time Targets
+
+| Application     | Current   | After Code Fixes | After All Optimizations |
+| --------------- | --------- | ---------------- | ----------------------- |
+| **web-mx**      | \~19 min  | \~10-12 min      | \<8 min                 |
+| **web-cx-blog** | \~10 min  | \~5-6 min        | \<4 min                 |
+| **web-corp**    | \~6 min   | \~4 min          | \<3 min                 |
+| **web-dx**      | \~5 min   | \~3-4 min        | \<2.5 min               |
+| **web-ddfw**    | \~3 min   | \~2 min          | \<1.5 min               |
+| **web-ads**     | \~1.5 min | \~1 min          | \<1 min                 |
+
+## Key Metrics
+
+| Metric                            | Impact                         |
+| --------------------------------- | ------------------------------ |
+| API response sizes                | -67% (include level reduction) |
+| Homepage API calls                | -99% (with caching)            |
+| Build log noise                   | -90%+ (with log gating)        |
+| Algolia 7MB errors                | Eliminated (MAX\_RECORDS fix)  |
+| Rebuild time (unchanged packages) | Near-zero (with Turborepo)     |
+
+***
+
+# Part 5: Risks & Mitigations
+
+## Turbopack Compatibility
+
+**Risk**: Custom webpack configuration may not translate directly.
+
+**Mitigation**:
+
+* Test with `--turbopack` flag before full migration
+* Keep `--webpack` fallback available
+* Audit custom loaders and plugins
+
+## Cache Invalidation
+
+**Risk**: Stale Turborepo cache causing incorrect builds.
+
+**Mitigation**:
+
+* Configure `globalEnv` in turbo.json with all environment variables that affect builds
+* Use environment-specific cache keys
+* Document cache purging: `turbo run build --force`
+
+## Breaking Changes
+
+**Risk**: Next.js 16 introduces breaking changes.
+
+**Mitigation**:
+
+* Follow official upgrade guide
+* Run Next.js codemods
+* Regression test each app
+
+## Include Level Reduction
+
+**Risk**: Deeply nested content may not render correctly with include\=3.
+
+**Mitigation**:
+
+* Visual regression test all page types
+* Add content-type specific overrides for edge cases
+* Monitor for missing data errors
+
+***
+
+# Part 6: Testing Recommendations
+
+## Before Implementation
+
+1. Record baseline build time and memory usage per app
+2. Count total Contentful API calls during build
+3. Document any existing build failures
+
+## After Each Fix
+
+1. Visual regression test all page types
+2. Verify deeply nested content renders correctly
+3. Compare JSON payload sizes before/after
+4. Monitor for rate limiting errors
+
+## Monitoring
+
+1. Track build times per app in CI/CD
+2. Add Contentful API call counting
+3. Monitor response sizes in development
+4. Alert on build failures
+
+## Measurement Tools
+
+1. **Vercel Build Analytics** - Per-deployment timing
+2. **Turborepo `--summarize`** - Cache hit/miss rates
+3. **Next.js build output** - Page generation times
+
+***
+
+# Part 7: Implementation Roadmap
+
+## Phase 1: Quick Wins (Week 1)
+
+* [ ] Reduce MAX\_RECORDS to 100
+* [ ] Reduce GENERAL/PAGE include levels to 3
+* [ ] Enable Enhanced Build Machines on Vercel
+
+## Phase 2: Caching Layer (Week 2)
+
+* [ ] Reduce blogPost homepage include to LINKS
+* [ ] Implement homepage caching during build
+* [ ] Reduce build log noise
+
+## Phase 3: Turborepo Integration (Week 3-4)
+
+* [ ] Add turbo.json configuration
+* [ ] Update package.json scripts
+* [ ] Enable remote caching
+* [ ] Document cache invalidation procedures
+
+## Phase 4: Next.js Upgrade (Future)
+
+* [ ] Upgrade to Next.js 15
+* [ ] Enable Turbopack for development
+* [ ] Test Turbopack builds in staging
+* [ ] Plan Next.js 16 migration
+
+***
+
+# References
+
+## Contentful
+
+* [Contentful API Limits](https://www.contentful.com/developers/docs/references/content-delivery-api/#/introduction/api-rate-limits)
+* [Include Depth Documentation](https://www.contentful.com/developers/docs/references/content-delivery-api/#/reference/links)
+
+## Next.js & Turbopack
+
+* [Next.js 15 Release](https://nextjs.org/blog/next-15)
+* [Next.js 15.3 - Turbopack Build Alpha](https://nextjs.org/blog/next-15-3)
+* [Next.js 15.5 - Turbopack Build Beta](https://nextjs.org/blog/next-15-5)
+* [Turbopack Dev is Now Stable](https://nextjs.org/blog/turbopack-for-development-stable)
+* [Turbopack API Reference](https://nextjs.org/docs/app/api-reference/turbopack)
+* [Upgrading to Next.js 16](https://nextjs.org/docs/app/guides/upgrading/version-16)
+
+## Vercel
+
+* [Managing Builds](https://vercel.com/docs/builds/managing-builds)
+* [Turbo Build Machines](https://vercel.com/changelog/turbo-build-machines)
+* [Enhanced Build Machines](https://vercel.com/changelog/enhanced-builds-now-have-double-the-compute)
+
+## Turborepo
+
+* [Remote Caching](https://vercel.com/docs/monorepos/remote-caching)
+* [Deploying Turborepo to Vercel](https://vercel.com/docs/monorepos/turborepo)
+* [Core Concepts](https://turborepo.com/docs/core-concepts/remote-caching)
