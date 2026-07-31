@@ -16,7 +16,11 @@ import { Label } from '@/components/ui/label'
 export function LoginClient() {
   const router = useRouter()
   const searchParams = useSearchParams()
-  const redirect = searchParams.get('redirect') ?? '/'
+  const requestedRedirect = searchParams.get('redirect')
+  const redirect =
+    !requestedRedirect || requestedRedirect === '/'
+      ? '/docs'
+      : requestedRedirect
 
   const [password, setPassword] = useState('')
   const [error, setError] = useState('')
